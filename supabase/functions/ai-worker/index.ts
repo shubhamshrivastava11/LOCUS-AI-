@@ -156,15 +156,18 @@ async function callClaude(
       // (Haiku 4.5 silently skips cache below the 4096-token prefix floor —
       // both cache_* fields stay 0 with no error).
       const usage = data.usage ?? {};
-      console.log(JSON.stringify({
-        event: "anthropic_usage",
-        tool: toolName,
-        model,
-        input_tokens: usage.input_tokens ?? 0,
-        output_tokens: usage.output_tokens ?? 0,
-        cache_creation_input_tokens: usage.cache_creation_input_tokens ?? 0,
-        cache_read_input_tokens: usage.cache_read_input_tokens ?? 0,
-      }));
+      // Sample 10% of successful calls to monitor cache hit/creation without log bloat
+      if (Math.random() < 0.1) {
+        console.log(JSON.stringify({
+          event: "anthropic_usage",
+          tool: toolName,
+          model,
+          input_tokens: usage.input_tokens ?? 0,
+          output_tokens: usage.output_tokens ?? 0,
+          cache_creation_input_tokens: usage.cache_creation_input_tokens ?? 0,
+          cache_read_input_tokens: usage.cache_read_input_tokens ?? 0,
+        }));
+      }
       const block = (data.content ?? []).find((b: { type?: string }) => b.type === "tool_use");
       if (!block) throw new Error(`Claude did not return a tool_use block for ${toolName}`);
       return block.input as Record<string, unknown>;
@@ -317,8 +320,8 @@ Format: classification, confidence, reason_code, record_type, status, decision_s
 13. "Yeah let's go with that." (Slack, no prior message in this event)
 -> UNCERTAIN, 0.4, INSUFFICIENT_CONTEXT, decision, proposed, decision_statement="Agreed to an unspecified option referenced in this message", rationale=null, alternatives_considered=[], actors=[]
 
-14. "Alice will own the frontend migration, Bob will handle the backend piece." (Slack, U_ALICE, U_BOB)
--> KEEP, 0.9, ACTION_ASSIGNED, action_item, decided, decision_statement="Own the frontend migration (Alice); handle the backend migration (Bob)", rationale=null, alternatives_considered=[], actors=[{source_actor_id:"U_ALICE", role:"decided_by"}, {source_actor_id:"U_BOB", role:"mentioned"}]
+14. "Alice will own the frontend migration." (Slack, U_ALICE)
+-> KEEP, 0.9, ACTION_ASSIGNED, action_item, decided, decision_statement="Own the frontend migration", rationale=null, alternatives_considered=[], actors=[{source_actor_id:"U_ALICE", role:"decided_by"}]
 
 15. "We chose Stripe over Braintree because their docs and webhook support are better." (Notion)
 -> KEEP, 0.9, EXPLICIT_DECISION, decision, decided, decision_statement="Chose Stripe for payments over Braintree", rationale="Better docs and webhook support than Braintree", alternatives_considered=["Braintree"], actors=[]
@@ -355,7 +358,7 @@ Format: classification, confidence, reason_code, record_type, status, decision_s
 -> DISCARD, 0.9, UNRELATED_CONTENT (no extraction) — logistics only
 
 26. "Can someone book Conference Room B for Thursday 3pm?" (Slack)
--> DISCARD, 0.75, UNRELATED_CONTENT (no extraction) — pure logistics, no assigned owner
+-> KEEP, 0.75, ACTION_ASSIGNED, action_item, decided, decision_statement="Book Conference Room B for Thursday 3pm", rationale=null, alternatives_considered=[], actors=[]
 
 27. "Deploy is blocked until the staging cert is renewed; nothing ships until then." (Slack)
 -> KEEP, 0.9, BLOCKER_IDENTIFIED, blocker, decided, decision_statement="Blocked on staging cert renewal before any deploy ships", rationale=null, alternatives_considered=[], actors=[]
