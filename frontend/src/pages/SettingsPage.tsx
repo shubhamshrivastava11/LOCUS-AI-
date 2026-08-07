@@ -574,7 +574,7 @@ function ConnectedSourcesSettings() {
         Connected Sources
       </h1>
       <p className="mt-1 text-[14px] text-[#6B7280]">
-        Manage the tools Locus reads to build organizational memory.
+        Manage the tools Locus AI reads to build organizational memory.
       </p>
 
       <div className="mt-8 overflow-hidden rounded-2xl border border-[#E8E8ED] bg-white shadow-[0_1px_2px_rgba(16,24,40,0.04)]">
@@ -663,7 +663,7 @@ function ConnectedSourcesSettings() {
               Disconnect {disconnectTargetMeta.name}?
             </h2>
             <p className="mt-2 text-[14px] leading-5 text-[#6B7280]">
-              Locus will stop reading new content from {disconnectTargetMeta.name}. Choose what
+              Locus AI will stop reading new content from {disconnectTargetMeta.name}. Choose what
               happens to the decisions already captured from it.
             </p>
 
@@ -747,7 +747,7 @@ function ConnectedSourcesSettings() {
               Connecting {CONNECTED_SOURCE_META.find((s) => s.id === syncModeTarget)?.name}
             </h2>
             <p className="mt-2 text-[14px] leading-5 text-[#6B7280]">
-              What should Locus read on this connection?
+              What should Locus AI read on this connection?
             </p>
 
             <div className="mt-4 flex flex-col gap-2">
@@ -759,8 +759,8 @@ function ConnectedSourcesSettings() {
                 <span className="text-[14px] font-semibold text-[#111827]">Full history</span>
                 <span className="text-[13px] text-[#6B7280]">
                   {syncModeTarget === 'slack'
-                    ? 'Read recent history from every channel Locus can see, not just new messages.'
-                    : 'Read everything Locus can see again, from the beginning.'}
+                    ? 'Read recent history from every channel Locus AI can see, not just new messages.'
+                    : 'Read everything Locus AI can see again, from the beginning.'}
                 </span>
               </button>
               <button
@@ -875,7 +875,7 @@ function CaptureControlsSettings() {
         Build Memory
       </h1>
       <p className="mt-1 text-[14px] text-[#6B7280]">
-        Control what Locus learns from, from where, and when.
+        Control what Locus AI learns from, from where, and when.
       </p>
 
       <section className="mt-8">
@@ -890,7 +890,7 @@ function CaptureControlsSettings() {
                 Pause all learning
               </p>
               <p className="mt-1 max-w-[520px] text-[13px] leading-relaxed text-[#6B7280]">
-                Temporarily stop Locus from reading new messages. All
+                Temporarily stop Locus AI from reading new messages. All
                 existing memory is preserved and search remains
                 available.
               </p>
@@ -1174,7 +1174,7 @@ export default function SettingsPage() {
               Privacy
             </h1>
             <p className="mt-1 text-[14px] text-[#6B7280]">
-              Control what Locus can read and how long data is kept.
+              Control what Locus AI can read and how long data is kept.
             </p>
 
             <div className="mt-8 rounded-2xl border border-[#E8E8ED] bg-white p-5 shadow-[0_1px_2px_rgba(16,24,40,0.04)]">
@@ -1185,7 +1185,7 @@ export default function SettingsPage() {
                     Raw message retention: 30 days
                   </p>
                   <p className="mt-1 text-[13px] leading-relaxed text-[#6B7280]">
-                    Locus reads messages to build structured memory, then
+                    Locus AI reads messages to build structured memory, then
                     permanently deletes the raw content within 30 days. Only the
                     extracted context summary is stored, never
                     the full message thread.
@@ -1217,7 +1217,7 @@ export default function SettingsPage() {
                       Block non-essential cookies
                     </p>
                     <p className="mt-1 max-w-[560px] text-[13px] leading-relaxed text-[#6B7280]">
-                      Only keeps the cookies strictly required for Locus to
+                      Only keeps the cookies strictly required for Locus AI to
                       function, such as your login session and security tokens.
                       Turning this on may mean your preferences and filter
                       settings won&apos;t be remembered between visits.
@@ -1262,7 +1262,7 @@ export default function SettingsPage() {
                       Exclude private channels
                     </p>
                     <p className="mt-1 max-w-[560px] text-[13px] leading-relaxed text-[#6B7280]">
-                      Locus will skip private Slack channels entirely, even if
+                      Locus AI will skip private Slack channels entirely, even if
                       you&apos;re a member and have granted access.
                     </p>
                   </div>
@@ -1316,7 +1316,7 @@ export default function SettingsPage() {
                   {
                     id: 'readonly-oauth',
                     icon: <ShieldIcon />,
-                    text: 'Read-only OAuth. Locus never writes to Slack, Notion, or Gmail.',
+                    text: 'Read-only OAuth. Locus AI never writes to Slack, Notion, or Gmail.',
                   },
                   {
                     id: 'raw-deleted',
@@ -1346,7 +1346,7 @@ export default function SettingsPage() {
                         <path d="M9 12l2 2 4-4" stroke="#5A45FF" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" />
                       </svg>
                     ),
-                    text: 'Read-only OAuth. Locus never writes to Slack, Notion, or Gmail.',
+                    text: 'Read-only OAuth. Locus AI never writes to Slack, Notion, or Gmail.',
                   },
                 ].map((item) => (
                   <div
@@ -1370,7 +1370,7 @@ export default function SettingsPage() {
               Notifications
             </h1>
             <p className="mt-1 text-[14px] text-[#6B7280]">
-              Control how and when Locus reaches you.
+              Control how and when Locus AI reaches you.
             </p>
 
             <div className="mt-8 rounded-2xl border border-[#E8E8ED] bg-white p-5 shadow-[0_1px_2px_rgba(16,24,40,0.04)]">
@@ -1414,7 +1414,7 @@ export default function SettingsPage() {
                   <div className="min-w-0">
                     <p className="text-[15px] font-semibold text-[#111827]">In App</p>
                     <p className="mt-1 max-w-[560px] text-[13px] leading-relaxed text-[#6B7280]">
-                      Show a notification badge in the Locus dashboard when new
+                      Show a notification badge in the Locus AI dashboard when new
                       captures arrive.
                     </p>
                   </div>

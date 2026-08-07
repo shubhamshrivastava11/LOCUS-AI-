@@ -22,7 +22,7 @@ export default function LandingPage({
       <section id="how-it-works" aria-label="How it works">
         <HowItWorks />
       </section>
-      <section id="why-locus" aria-label="Why Locus">
+      <section id="why-locus-ai" aria-label="Why Locus AI">
         <WhyLocus />
       </section>
     </div>

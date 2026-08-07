@@ -96,7 +96,7 @@ export default function WelcomePage() {
 
         <div className="mt-16 w-full max-w-[520px] text-center">
           <h2 className="text-[32px] font-bold tracking-[-0.02em] text-[#18181b]">
-            Welcome to Locus
+            Welcome to Locus AI
           </h2>
           <p className="mt-3 text-[16px] leading-relaxed text-[#6b7280]">
             Connect your tools and never lose a memory again.

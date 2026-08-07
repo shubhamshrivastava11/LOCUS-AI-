@@ -324,7 +324,7 @@ function clearLocalSession() {
 
 export default function AccountSettings() {
   const navigate = useNavigate()
-  const [name, setName] = useState('Locus User')
+  const [name, setName] = useState('Locus AI User')
   const [email, setEmail] = useState('No signed-in email')
   const [draftName, setDraftName] = useState(name)
   const [isEditing, setIsEditing] = useState(false)
@@ -340,7 +340,7 @@ export default function AccountSettings() {
   useEffect(() => {
     const demoEmail = sessionStorage.getItem(DEMO_EMAIL_KEY)
     if (demoEmail) {
-      setName('Locus User')
+      setName('Locus AI User')
       setEmail(demoEmail)
       return
     }
@@ -351,7 +351,7 @@ export default function AccountSettings() {
 
     const applyUser = (user: User | null) => {
       if (!user) {
-        setName('Locus User')
+        setName('Locus AI User')
         setEmail('No signed-in email')
         return
       }
@@ -363,7 +363,7 @@ export default function AccountSettings() {
           .split(/[._-]+/)
           .filter(Boolean)
           .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
-          .join(' ') || 'Locus User'
+          .join(' ') || 'Locus AI User'
       const displayName =
         user.user_metadata.full_name ||
         user.user_metadata.name ||
@@ -709,7 +709,7 @@ export default function AccountSettings() {
               id="account-confirmation-title"
               className="mt-5 text-[20px] font-semibold text-[#202027]"
             >
-              {confirmation === 'delete' ? 'Delete account?' : 'Log out of Locus?'}
+              {confirmation === 'delete' ? 'Delete account?' : 'Log out of Locus AI?'}
             </h2>
             <p className="mt-3 text-[15px] leading-6 text-[#7A8292]">
               {confirmation === 'delete'

@@ -21,21 +21,21 @@ const tools: Tool[] = [
     id: 'slack',
     name: 'Slack',
     description:
-      "Capture memory from channels and threads you're already in. Locus listens — you stay focused.",
+      "Capture memory from channels and threads you're already in. Locus AI listens — you stay focused.",
     iconSrc: '/slack-logo.png',
   },
   {
     id: 'notion',
     name: 'Notion',
     description:
-      "Capture memory from channels and threads you're already in. Locus listens — you stay focused.",
+      "Capture memory from channels and threads you're already in. Locus AI listens — you stay focused.",
     iconSrc: '/notion-logo.png',
   },
   {
     id: 'gmail',
     name: 'Gmail',
     description:
-      "Capture memory from channels and threads you're already in. Locus listens — you stay focused.",
+      "Capture memory from channels and threads you're already in. Locus AI listens — you stay focused.",
     iconSrc: '/gmail-logo.png',
   },
 ]
@@ -153,7 +153,7 @@ export default function ConnectWorkspaces({ email, onContinue }: { email: string
           </h1>
           <p className="mx-auto mt-3 max-w-[760px] text-[15px] leading-[1.45] text-[#6b7280] sm:text-[17px]">
             <span className="block">
-              Your Locus account is ready. Next: connect Slack, Notion, and Gmail so
+              Your Locus AI account is ready. Next: connect Slack, Notion, and Gmail so
             </span>
             <span className="block">we can start capturing decisions.</span>
           </p>
@@ -204,7 +204,7 @@ export default function ConnectWorkspaces({ email, onContinue }: { email: string
 
                 <p className="mt-4 flex-1 text-[15px] leading-[1.45] text-[#6b7280]">
                   <span className="block">Capture memory from channels and</span>
-                  <span className="block">threads you're already in. Locus listens —</span>
+                  <span className="block">threads you're already in. Locus AI listens —</span>
                   <span className="block">you stay focused.</span>
                 </p>
 

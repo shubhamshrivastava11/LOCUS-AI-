@@ -115,8 +115,8 @@ function ConnectToolsPanel() {
           Connect your tools.
         </h2>
         <p className="mt-4 max-w-[420px] text-[15px] leading-[1.7] text-[#6b7280]">
-          Authorize Locus to read from the tools your team already lives in. No
-          exports, no copy-paste, no new workflows. Locus sits quietly in the
+          Authorize Locus AI to read from the tools your team already lives in. No
+          exports, no copy-paste, no new workflows. Locus AI sits quietly in the
           background and starts building organizational memory from day one.
         </p>
         <ul className="mt-6 space-y-3">
@@ -243,10 +243,10 @@ function CapturePanel() {
 
       <div>
         <h2 className="text-[28px] font-bold tracking-[-0.02em] text-[#111827]">
-          Locus builds <span className="text-[#5b52e8]">memory continuously.</span>
+          Locus AI builds <span className="text-[#5b52e8]">memory continuously.</span>
         </h2>
         <p className="mt-4 max-w-[420px] text-[15px] leading-[1.7] text-[#6b7280]">
-          As your team communicates normally, Locus reads the signal. It
+          As your team communicates normally, Locus AI reads the signal. It
           turns everyday work into organizational memory: context, knowledge,
           and understanding, each with a source link, owner, and timestamp.
         </p>
@@ -406,11 +406,11 @@ export default function HowItWorks() {
           HOW IT WORKS
         </p>
         <h1 className="mt-3 max-w-[720px] text-[36px] font-bold leading-[1.15] tracking-[-0.03em] text-[#111827] sm:text-[42px]">
-          See how Locus turns your team&apos;s activity into{' '}
+          See how Locus AI turns your team&apos;s activity into{' '}
           <span className="text-[#5b52e8]">shared memory.</span>
         </h1>
         <p className="mt-4 max-w-[640px] text-[15px] leading-[1.7] text-[#6b7280]">
-          Locus connects to Slack, Notion, and your other tools, continuously
+          Locus AI connects to Slack, Notion, and your other tools, continuously
           building organizational memory, surfacing context, and giving your
           whole team a searchable understanding of what the organization
           already knows.

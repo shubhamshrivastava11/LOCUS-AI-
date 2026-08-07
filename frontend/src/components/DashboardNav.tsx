@@ -42,7 +42,7 @@ function getInitials(name: string) {
 
 function getNameFromEmail(email: string) {
   const emailName = email.split('@')[0]?.replace(/[._-]+/g, ' ').trim()
-  if (!emailName) return 'Locus User'
+  if (!emailName) return 'Locus AI User'
 
   return emailName.replace(/\b\w/g, (letter) => letter.toUpperCase())
 }
@@ -52,7 +52,7 @@ export function DashboardNav() {
   const [menuOpen, setMenuOpen] = useState(false)
   const [profile, setProfile] = useState<ProfileUser>({
     userId: null,
-    name: 'Locus User',
+    name: 'Locus AI User',
     email: '',
     initials: 'LU',
   })
@@ -67,7 +67,7 @@ export function DashboardNav() {
     if (demoEmail) {
       setProfile({
         userId: null,
-        name: 'Locus User',
+        name: 'Locus AI User',
         email: demoEmail,
         initials: 'LU',
       })

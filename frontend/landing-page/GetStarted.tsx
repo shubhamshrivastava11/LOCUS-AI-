@@ -21,7 +21,7 @@ export default function GetStarted() {
             </h1>
 
             <p className="mt-4 max-w-[390px] text-[14.5px] leading-[1.65] text-[#6b7280]">
-              Locus continuously builds memory from your Slack and Notion
+              Locus AI continuously builds memory from your Slack and Notion
               workspaces so your team can ask anything it already knows, with
               links back to the original context.
             </p>
@@ -35,7 +35,7 @@ export default function GetStarted() {
             </button>
 
             <p className="mt-2.5 max-w-[370px] text-[12.5px] leading-[1.55] text-[#9ca3af]">
-              We&apos;ll connect Slack and Notion next so Locus can start
+              We&apos;ll connect Slack and Notion next so Locus AI can start
               building memory.
             </p>
 
