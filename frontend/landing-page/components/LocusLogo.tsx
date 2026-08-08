@@ -7,7 +7,8 @@ export function LocusLogo({
   variant?: 'dark' | 'light'
   size?: number
 }) {
-  const textColor = variant === 'light' ? 'text-white' : 'text-black'
+  const textColor =
+    variant === 'light' ? 'text-white' : 'text-[#374151]'
 
   return (
     <div className={`flex items-center gap-2.5 ${className}`}>
@@ -16,7 +17,7 @@ export function LocusLogo({
         alt=""
         width={size}
         height={size}
-        className="shrink-0 rounded-[6px]"
+        className="shrink-0 rounded-[8px]"
         style={{ width: size, height: size }}
       />
       <span className={`text-[14px] font-bold tracking-[0.04em] ${textColor}`}>

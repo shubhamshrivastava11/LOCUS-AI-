@@ -1,6 +1,5 @@
-import React, { useEffect, useState } from "react";
-import { Link } from "react-router-dom";
-import logoSrc from "./assets/locuslogo.png";
+import React from "react";
+import { LocusLogo } from "../landing-page/components/LocusLogo";
 
 
 type StepStatus = "complete" | "in-progress" | "pending";
@@ -17,13 +16,10 @@ interface DecisionReadyProps {
   onOpenSettings?: () => void;
 }
 
-const LocusLogo: React.FC = () => (
-  <Link to="/" className="flex items-center justify-center gap-2" aria-label="Locus AI home">
-    <img src={logoSrc} alt="Locus AI" className="h-8 w-8 rounded-[6px]" />
-    <span className="text-lg font-bold text-gray-900">
-      LOCUS <span className="text-[#5b52e8]">AI</span>
-    </span>
-  </Link>
+const LocusLogoMark: React.FC = () => (
+  <div className="flex justify-center">
+    <LocusLogo size={32} />
+  </div>
 );
 
 const GoogleIcon: React.FC = () => (
@@ -35,70 +31,35 @@ const GoogleIcon: React.FC = () => (
   </svg>
 );
 
-const CheckIcon: React.FC<{ isVisible: boolean }> = ({ isVisible }) => (
-  <svg viewBox="0 0 24 24" fill="none" className="h-4 w-4">
-    <path
-      d="M5 13l4 4L19 7"
-      stroke="#9CA3AF"
-      strokeWidth={3}
-      strokeLinecap="round"
-      strokeLinejoin="round"
-    />
-    <path
-      d="M5 13l4 4L19 7"
-      stroke="#aadf2e"
-      strokeWidth={3}
-      strokeLinecap="round"
-      strokeLinejoin="round"
-      pathLength="1"
-      className="transition-[stroke-dashoffset] duration-500 ease-out"
-      style={{
-        strokeDasharray: 1,
-        strokeDashoffset: isVisible ? 0 : 1,
-      }}
-    />
+const CheckIcon: React.FC = () => (
+  <svg viewBox="0 0 24 24" fill="none" className="h-3.5 w-3.5">
+    <path d="M5 13l4 4L19 7" stroke="white" strokeWidth={3} strokeLinecap="round" strokeLinejoin="round" />
   </svg>
 );
 
 const SpinnerIcon: React.FC = () => (
-  <svg viewBox="0 0 24 24" fill="none" className="h-4 w-4 animate-spin">
-    <circle cx="12" cy="12" r="9" stroke="#aadf2e" strokeWidth={3} strokeLinecap="round" strokeDasharray="14 40" />
+  <svg viewBox="0 0 24 24" fill="none" className="h-3 w-3 animate-spin">
+    <circle cx="12" cy="12" r="9" stroke="white" strokeWidth={3} strokeLinecap="round" strokeDasharray="14 40" />
   </svg>
 );
 
 interface StepRowProps {
   step: DecisionStep;
   isLast: boolean;
-  isRevealed: boolean;
 }
 
-const StepRow: React.FC<StepRowProps> = ({ step, isLast, isRevealed }) => {
-  const isActive = isRevealed && step.status !== "pending";
-  const bubbleClasses = isActive
-    ? "border-gray-900 bg-gray-900"
-    : "border-gray-300 bg-white";
+const StepRow: React.FC<StepRowProps> = ({ step, isLast }) => {
+  const bubbleClasses = step.status === "pending" ? "bg-gray-200" : "bg-gray-900";
   return (
     <div className="flex items-start">
       <div className="flex flex-col items-center">
-        <div
-          className={`flex h-8 w-8 flex-shrink-0 items-center justify-center rounded-full border transition-[transform,background-color,border-color] duration-300 ease-out ${bubbleClasses} ${
-            isRevealed ? "scale-100" : "scale-90"
-          }`}
-        >
-          {step.status === "complete" && <CheckIcon isVisible={isRevealed} />}
-          {step.status === "in-progress" && isRevealed && <SpinnerIcon />}
+        <div className={`flex h-6 w-6 flex-shrink-0 items-center justify-center rounded-full ${bubbleClasses}`}>
+          {step.status === "complete" && <CheckIcon />}
+          {step.status === "in-progress" && <SpinnerIcon />}
         </div>
-        {!isLast && (
-          <div className="my-1 h-14 w-0.5 overflow-hidden bg-gray-200">
-            <div
-              className={`h-full w-full origin-top bg-[#aadf2e] transition-transform duration-500 ease-out ${
-                isRevealed ? "scale-y-100" : "scale-y-0"
-              }`}
-            />
-          </div>
-        )}
+        {!isLast && <div className="my-1 h-8 w-px bg-lime-400" />}
       </div>
-      <p className={`ml-4 mt-0.5 text-[18px] sm:text-[20px] ${step.status === "pending" ? "text-gray-400" : "text-[#18181b]"} ${step.label === "Done" ? "font-semibold" : ""}`}>
+      <p className={`ml-3 mt-0.5 text-sm ${step.status === "pending" ? "text-gray-400" : "text-gray-900"} ${step.label === "Done" ? "font-semibold" : ""}`}>
         {step.label}
       </p>
     </div>
@@ -107,7 +68,7 @@ const StepRow: React.FC<StepRowProps> = ({ step, isLast, isRevealed }) => {
 
 const defaultSteps: DecisionStep[] = [
   { label: "Pulling your recent messages and pages", status: "complete" },
-  { label: "Classifying decisions, action items, and blockers", status: "complete" },
+  { label: "Classifying context into memory records", status: "complete" },
   { label: "Done", status: "complete" },
 ];
 
@@ -117,17 +78,6 @@ const DecisionReady: React.FC<DecisionReadyProps> = ({
   onGoToDashboard,
   onOpenSettings,
 }) => {
-  const [revealedStepCount, setRevealedStepCount] = useState(0);
-
-  useEffect(() => {
-    setRevealedStepCount(0);
-    const timers = steps.map((_, index) =>
-      window.setTimeout(() => setRevealedStepCount(index + 1), 250 + index * 600),
-    );
-
-    return () => timers.forEach((timer) => window.clearTimeout(timer));
-  }, [steps]);
-
   const handleGoToDashboard = () => {
     if (onGoToDashboard) {
       onGoToDashboard();
@@ -145,30 +95,23 @@ const DecisionReady: React.FC<DecisionReadyProps> = ({
   };
 
   return (
-    <div className="flex min-h-screen w-full items-center justify-center bg-[#f4f4f8] px-6 py-16">
-      <div className="w-full max-w-[900px] text-center">
-        <LocusLogo />
-        <h1 className="mt-10 text-[32px] font-bold text-[#18181b] sm:text-[40px]">
-          Building your team memory
+    <div className="flex min-h-screen w-full items-center justify-center bg-gray-50 px-6 py-16">
+      <div className="w-full max-w-md text-center">
+        <LocusLogoMark />
+        <h1 className="mt-10 text-2xl font-bold text-gray-900 sm:text-3xl">
+          Getting your memory ready
         </h1>
-        <p className="mx-auto mt-4 text-[17px] leading-[1.5] text-[#6b7280] sm:text-[20px]">
-          <span className="block">
-            This usually takes under a minute. Feel free to wait, or head to your
-          </span>
-          <span className="block">dashboard now — we'll keep going in the background.</span>
+        <p className="mx-auto mt-3 max-w-sm text-sm text-gray-500">
+          This usually takes under a minute. Feel free to wait, or head to your
+          dashboard now — we'll keep going in the background.
         </p>
-        <div className="mt-4 flex items-center justify-center gap-2 text-[16px] text-[#6b7280] sm:text-[18px]">
+        <div className="mt-3 flex items-center justify-center gap-1.5 text-sm text-gray-600">
           <GoogleIcon />
           Signed in as <span className="font-semibold text-gray-900">{userEmail}</span>
         </div>
-        <div className="mx-auto mt-16 flex max-w-[580px] flex-col items-start text-left">
+        <div className="mx-auto mt-12 flex max-w-xs flex-col items-start text-left">
           {steps.map((step, i) => (
-            <StepRow
-              key={step.label}
-              step={step}
-              isLast={i === steps.length - 1}
-              isRevealed={i < revealedStepCount}
-            />
+            <StepRow key={step.label} step={step} isLast={i === steps.length - 1} />
           ))}
         </div>
         <button

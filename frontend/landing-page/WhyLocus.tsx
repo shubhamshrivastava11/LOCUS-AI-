@@ -1,4 +1,5 @@
 import { useNavigate } from 'react-router-dom'
+import { LocusLogo } from './components/LocusLogo'
 
 function SparkleIcon() {
   return (
@@ -105,39 +106,28 @@ function BoltIcon() {
 }
 
 function FooterLogo() {
-  return (
-    <div className="flex items-center gap-2.5">
-      <img
-        src="/locus-mark.png"
-        alt=""
-        className="h-8 w-8 rounded-lg"
-      />
-      <span className="text-[14px] font-bold tracking-[0.06em] text-white">
-        LOCUS <span className="text-[#a5b4fc]">AI</span>
-      </span>
-    </div>
-  )
+  return <LocusLogo variant="light" size={32} />
 }
 
 const FEATURES = [
   {
     title: 'Zero manual entry',
     description:
-      'Every failed workaround failed because it required effort. Locus asks for none. It learns continuously in the background from day one.',
+      'Every failed workaround failed because it required effort. Locus asks for none — it learns continuously in the background from day one.',
     icon: <SparkleIcon />,
     iconBg: 'bg-[#eee8ff]',
   },
   {
     title: 'Always cited',
     description:
-      'Every memory record links directly to its source: the Slack thread, the Notion doc, or the Gmail thread. No context is lost in translation.',
+      'Every memory record links directly to its source — the Slack thread, the Notion doc, the Gmail thread. No context lost in translation.',
     icon: <ExternalLinkIcon />,
     iconBg: 'bg-[#eee8ff]',
   },
   {
     title: 'Full memory lifecycle',
     description:
-      'When understanding changes, both records stay with a link between them. See exactly when and why your team updated its context.',
+      'When understanding changes, both records stay — with a link between them. See exactly when and why your team updated its context.',
     icon: <TrendIcon />,
     iconBg: 'bg-[#e8f9e8]',
   },
@@ -151,14 +141,14 @@ const FEATURES = [
   {
     title: 'Useful solo, powerful as a team',
     description:
-      'Get value on day one. Invite your team and knowledge becomes shared institutional memory that is searchable by everyone.',
+      'Get value on day one. Invite your team and knowledge becomes shared institutional memory — searchable by everyone.',
     icon: <UsersIcon />,
     iconBg: 'bg-[#e8f9e8]',
   },
   {
     title: 'Built for AI agents too',
     description:
-      'Locus exposes your decision layer as MCP tools, so any AI agent can query your team\'s context, not just your teammates.',
+      'Locus exposes your decision layer as MCP tools — any AI agent can query your team\'s context, not just your teammates.',
     icon: <BoltIcon />,
     iconBg: 'bg-[#eee8ff]',
   },
@@ -171,7 +161,7 @@ export default function WhyLocus() {
     <div className="bg-[#f7f7f9]">
       <div className="mx-auto max-w-[1040px] px-6 pb-4 pt-16 sm:px-10 lg:px-12 lg:pt-20">
         <p className="text-[12px] font-semibold tracking-[0.08em] text-[#5b52e8]">
-          WHY LOCUS
+          — WHY LOCUS
         </p>
         <h1 className="mt-3 max-w-[720px] text-[36px] font-bold leading-[1.15] tracking-[-0.03em] text-[#111827] sm:text-[42px]">
           The memory layer your team is{' '}
@@ -179,7 +169,7 @@ export default function WhyLocus() {
         </h1>
         <p className="mt-4 max-w-[620px] text-[15px] leading-[1.7] text-[#6b7280]">
           Existing tools are good at finding documents. Locus turns everyday
-          work into organizational memory: context, knowledge, and
+          work into organizational memory — context, knowledge, and
           understanding your team can ask for anytime.
         </p>
 
@@ -231,7 +221,7 @@ export default function WhyLocus() {
               <FooterLogo />
               <p className="mt-4 text-[13.5px] leading-[1.7] text-[#9ca3af]">
                 Locus turns everyday work into organizational memory from your
-                Slack, Notion, and Gmail, so your team can ask anything it
+                Slack, Notion, and Gmail — so your team can ask anything it
                 already knows.
               </p>
             </div>

@@ -1,5 +1,4 @@
 import { LocusLogo } from './LocusLogo'
-import { SourceLogo, type SourceName } from '../../src/components/SourceLogo'
 
 function SearchIcon() {
   return (
@@ -37,6 +36,19 @@ function BlockerIcon() {
   )
 }
 
+function SourceIcon({ label }: { label: string }) {
+  const colors: Record<string, string> = {
+    Slack: 'bg-[#4A154B]',
+    Notion: 'bg-[#111827]',
+    Gmail: 'bg-[#EA4335]',
+  }
+  return (
+    <div className={`flex h-6 w-6 shrink-0 items-center justify-center rounded-full text-[9px] font-bold text-white ${colors[label] ?? 'bg-gray-700'}`}>
+      {label[0]}
+    </div>
+  )
+}
+
 const NAV_ITEMS = ['How it works', 'Dashboard', 'Memory Explorer', 'Pulse', 'Settings']
 
 const RECENT_SEARCHES = [
@@ -45,13 +57,13 @@ const RECENT_SEARCHES = [
   'What context exists around pricing changes?',
 ]
 
-const SOURCES: SourceName[] = ['Slack', 'Notion', 'Gmail']
+const SOURCES = ['Slack', 'Notion', 'Gmail']
 
 const CAPTURES = [
   { tag: 'Decision', tagClass: 'bg-[#eee8ff] text-[#5b52e8]', text: 'Adopt PostgreSQL for the context layer' },
-  { tag: 'Blocker', tagClass: 'bg-[#fee2e2] text-[#ef4444]', text: 'Adopt PostgreSQL for the context layer' },
-  { tag: 'Action item', tagClass: 'bg-[#ecfccb] text-[#65a30d]', text: 'Adopt PostgreSQL for the context layer' },
-  { tag: 'Decision', tagClass: 'bg-[#eee8ff] text-[#5b52e8]', text: 'Adopt PostgreSQL for the context layer' },
+  { tag: 'Blocker', tagClass: 'bg-[#fee2e2] text-[#ef4444]', text: 'Legal sign-off blocking onboarding copy' },
+  { tag: 'Action item', tagClass: 'bg-[#ecfccb] text-[#65a30d]', text: 'Notify client services of revised launch date' },
+  { tag: 'Decision', tagClass: 'bg-[#eee8ff] text-[#5b52e8]', text: 'Ship v2 without custom fields feature' },
 ]
 
 export function DashboardPreview() {
@@ -161,7 +173,7 @@ export function DashboardPreview() {
               <ul className="mt-2 space-y-2">
                 {SOURCES.map((source) => (
                   <li key={source} className="flex items-center gap-2">
-                    <SourceLogo source={source} className="h-6 w-6 shrink-0 rounded-[4px]" />
+                    <SourceIcon label={source} />
                     <div className="min-w-0 flex-1">
                       <p className="text-[11px] font-semibold text-[#111827]">{source}</p>
                       <p className="text-[9.5px] text-[#9ca3af]">Synced today 9:00 am</p>
@@ -187,9 +199,12 @@ export function DashboardPreview() {
               </p>
               <ul className="mt-2 space-y-2">
                 {CAPTURES.map((capture, index) => (
-                  <li key={`${capture.tag}-${index}`} className="flex items-start gap-1.5">
+                  <li
+                    key={`${capture.tag}-${index}`}
+                    className="grid grid-cols-[58px_minmax(0,1fr)] items-start gap-2"
+                  >
                     <span
-                      className={`mt-0.5 shrink-0 rounded px-1.5 py-0.5 text-[8.5px] font-semibold ${capture.tagClass}`}
+                      className={`inline-flex w-[58px] justify-center rounded px-1.5 py-0.5 text-[8.5px] font-semibold ${capture.tagClass}`}
                     >
                       {capture.tag}
                     </span>
