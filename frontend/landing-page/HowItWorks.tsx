@@ -308,8 +308,7 @@ function FindDecisionsPanel() {
         <p className="mt-4 max-w-[420px] text-[15px] leading-[1.7] text-[#6b7280]">
           Search across your full organizational memory with natural-language
           queries. Filter by owner, date, team, or tag. Every result links back
-          to the original Slack thread or Notion page so you always have full
-          context.
+          to the original Slack thread, Notion page, or Gmail thread so you always have full context.
         </p>
         <ul className="mt-6 space-y-3">
           {[
@@ -400,7 +399,7 @@ export default function HowItWorks() {
   }
 
   return (
-    <div className="bg-white px-6 py-16 sm:px-10 lg:px-16 lg:py-20">
+    <div className="bg-white px-6 pb-16 pt-0 sm:px-10 sm:pt-1 lg:px-16 lg:pb-20 lg:pt-2">
       <div className="mx-auto max-w-[980px]">
         <p className="text-[12px] font-semibold tracking-[0.08em] text-[#5b52e8]">
           HOW IT WORKS
@@ -432,3 +431,7 @@ export default function HowItWorks() {
     </div>
   )
 }
+
+
+
+

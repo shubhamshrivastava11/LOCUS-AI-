@@ -2,7 +2,7 @@ const steps = [
   {
     number: 1,
     title: 'Connect Tools',
-    description: 'Slack, Notion, Gmails',
+    description: 'Slack, Notion, Gmail',
   },
   {
     number: 2,
@@ -18,7 +18,7 @@ const steps = [
 
 export function ProcessStepper() {
   return (
-    <div className="mt-auto pt-10">
+    <div className="mt-8 max-w-[520px] pt-0 lg:mt-10">
       <div className="relative flex items-start justify-between">
         <div className="absolute left-[calc(16.67%-8px)] right-[calc(16.67%-8px)] top-4 h-px bg-[#e5e7eb]" />
 
@@ -39,3 +39,4 @@ export function ProcessStepper() {
     </div>
   )
 }
+
