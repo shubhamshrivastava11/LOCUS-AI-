@@ -6,7 +6,7 @@ const steps = [
   },
   {
     number: 2,
-    title: 'Locus builds memory',
+    title: 'Locus AI builds memory',
     description: 'Learn continuously in the background',
   },
   {

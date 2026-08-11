@@ -25,6 +25,7 @@ from datetime import datetime, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 from uuid import uuid4
 
+import pytest
 from fastapi.testclient import TestClient
 
 from app.main import app
@@ -64,6 +65,19 @@ def _request_body(**overrides):
     body = {"question": "Why did we choose Stripe?"}
     body.update(overrides)
     return body
+
+
+@pytest.fixture(autouse=True)
+def _default_resolved_scopes():
+    """resolve_permission_scopes() is now async and hits a real DB lookup
+    (the caller's own auth email) - default every test in this file to the
+    old always-[] behavior unless a test explicitly patches it to something
+    else (TestServerDerivedScopesAreUsed does, for exactly that reason)."""
+    with patch(
+        "modules.search.router.resolve_permission_scopes",
+        AsyncMock(return_value=[]),
+    ):
+        yield
 
 
 def _patched(matches, answer_result):
@@ -197,7 +211,7 @@ class TestServerDerivedScopesAreUsed:
         pool_patch, vector_patch, answer_patch = _patched([], answer_result)
 
         with pool_patch, vector_patch, answer_patch, patch(
-            "modules.search.router.resolve_permission_scopes", return_value=["team:billing"]
+            "modules.search.router.resolve_permission_scopes", AsyncMock(return_value=["team:billing"])
         ) as resolver_mock:
             client.post("/search", json=_request_body(), headers=_auth_headers(role="member"))
 
@@ -216,7 +230,7 @@ class TestServerDerivedScopesAreUsed:
         pool_patch, vector_patch, answer_patch = _patched([scoped], answer_result)
 
         with pool_patch, vector_patch, answer_patch, patch(
-            "modules.search.router.resolve_permission_scopes", return_value=["team:billing"]
+            "modules.search.router.resolve_permission_scopes", AsyncMock(return_value=["team:billing"])
         ):
             response = client.post("/search", json=_request_body(), headers=_auth_headers())
 

@@ -11,9 +11,10 @@ from pydantic import BaseModel, Field
 
 
 class ActorRef(BaseModel):
-    """A decision actor with their role."""
+    """A decision actor with their role and, when known, a real name."""
     id: str
     role: str
+    name: Optional[str] = None
 
 
 class DecisionOut(BaseModel):
@@ -30,6 +31,10 @@ class DecisionOut(BaseModel):
     scope: str
     confidence: float
     source_links: list[str] = Field(default_factory=list)
+    source_platforms: list[str] = Field(
+        default_factory=list,
+        description="Distinct originating platforms ('gmail'/'slack'/'notion') this decision was captured from.",
+    )
     created_at: datetime
     updated_at: datetime
 

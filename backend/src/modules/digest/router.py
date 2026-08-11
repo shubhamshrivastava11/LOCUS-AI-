@@ -56,7 +56,7 @@ async def get_digest(
     (and stores) only when no row exists or refresh=true.
     """
     pool = get_db_pool()
-    permission_scopes = resolve_permission_scopes(ctx)
+    permission_scopes = await resolve_permission_scopes(ctx)
     week_of = digest_week_of()
     user_id = ctx.user_id if scope == "personal" else None
 

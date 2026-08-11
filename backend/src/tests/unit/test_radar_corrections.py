@@ -62,6 +62,10 @@ async def test_list_decisions_hydrates_radar_fields():
         "decision_id": decision_id,
         "actor_id": actor_id,
         "role": "decided_by",
+        "display_name": "Radar Actor",
+        "email": None,
+        "notion_user_id": None,
+        "slack_user_id": None,
     }
 
     mock_source_row = {
@@ -99,6 +103,7 @@ async def test_list_decisions_hydrates_radar_fields():
     assert len(item.actors) == 1
     assert item.actors[0].id == str(actor_id)
     assert item.actors[0].role == "decided_by"
+    assert item.actors[0].name == "Radar Actor"
 
 
 @pytest.mark.asyncio

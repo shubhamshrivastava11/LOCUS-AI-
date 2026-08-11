@@ -32,6 +32,7 @@ from modules.decisions.pipeline_persistence import (
     PipelinePersistenceError,
     persist_decision_from_extraction,
 )
+from modules.ingestion.dedup.ledger import mark_processed
 from modules.ingestion.envelope.schemas import EventEnvelope
 from queues.pgmq.producer import EmbeddingEnqueueError, enqueue_embedding_job
 
@@ -86,6 +87,7 @@ async def process_and_persist_event(
 
     if ai_result.triage.decision == TriageDecision.DISCARD:
         log.debug("Triage DISCARD - persistence skipped")
+        await mark_processed(event.tenant_id, origin_raw_event_id)
         return IngestionProcessingResult(
             triage=ai_result.triage,
             extraction=None,
@@ -109,6 +111,13 @@ async def process_and_persist_event(
         )
     except PipelinePersistenceError as exc:
         raise IngestionPersistenceError(f"Failed to persist decision: {exc}") from exc
+
+    # Marked done as soon as the decision itself is safely persisted, before
+    # attempting the embedding enqueue - a failed enqueue from here on is a
+    # separate, already-documented gap (see IngestionEmbeddingEnqueueError),
+    # not a reason to let a retry re-run triage/extraction and risk a second
+    # decision for the same raw event.
+    await mark_processed(event.tenant_id, origin_raw_event_id)
 
     log.info("Persisted decision id=%s triage=%s", decision_id, ai_result.triage.decision.value)
 

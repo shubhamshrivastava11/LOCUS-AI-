@@ -3,6 +3,9 @@
 .env.*
 !.env.example
 
+# Vercel project link (local-only, mirrors frontend/.vercel)
+.vercel/
+
 # Python
 __pycache__/
 *.pyc

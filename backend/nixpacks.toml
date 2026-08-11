@@ -1,0 +1,2 @@
+[phases.setup]
+aptPkgs = ["gcc", "python3-dev", "libssl-dev", "libffi-dev", "pkg-config"]

@@ -75,90 +75,111 @@ async function assertMembership(
   }
 }
 
-/** Read and validate tenant_id carried in the provider OAuth `state` param. */
-export function parseTenantState(state: string | null): string {
-  const tenantId = state?.trim() ?? "";
+const DEFAULT_FRONTEND_URL = Deno.env.get("FRONTEND_URL") ?? "http://localhost:5173";
+
+// Comma-separated allowlist of frontend origins that are allowed to receive
+// the OAuth popup redirect (Supabase secret ALLOWED_FRONTEND_ORIGINS). Every
+// independent deployment (the team's shared Vercel app, a contributor's own
+// fork's Vercel project, local dev) needs its origin listed here to complete
+// the source-connect flow - this is a public redirect target, so an
+// unvalidated caller-supplied origin would be an open redirect.
+const ALLOWED_FRONTEND_ORIGINS = (Deno.env.get("ALLOWED_FRONTEND_ORIGINS") ?? "")
+  .split(",")
+  .map((s) => s.trim())
+  .filter(Boolean);
+
+/**
+ * Resolves which frontend origin the OAuth popup should redirect back to,
+ * from the `redirect_origin` query param the frontend sends on /authorize
+ * (see frontend/src/lib/sourceConnections.ts). Falls back to
+ * FRONTEND_URL/localhost for any missing or non-allowlisted value rather
+ * than failing outright, so an old cached link still lands somewhere valid.
+ */
+export function resolveRedirectOrigin(url: URL): string {
+  const candidate = url.searchParams.get("redirect_origin")?.trim();
+  if (candidate && ALLOWED_FRONTEND_ORIGINS.includes(candidate)) return candidate;
+  return DEFAULT_FRONTEND_URL;
+}
+
+// "full" backfills everything a poller can see (the existing default -
+// last_synced_at gets cleared so the next poll treats it as never-synced).
+// "new" only picks up content from the moment of (re)connecting onward.
+// Only meaningful for poll-based connectors (Notion, Gmail) - Slack is
+// pure push/webhook with no backfill mechanism at all, so slack-oauth
+// never reads this field even though it flows through the same state.
+export type SyncMode = "full" | "new";
+
+/** Carries tenant_id + the resolved redirect origin (+ optional sync mode) through the provider's OAuth `state` round trip. */
+export function encodeState(tenantId: string, redirectOrigin: string, syncMode?: SyncMode): string {
+  return btoa(JSON.stringify({ t: tenantId, o: redirectOrigin, m: syncMode }));
+}
+
+/** Read and validate tenant_id + redirect origin (+ optional sync mode) carried in the provider OAuth `state` param. */
+export function parseTenantState(
+  state: string | null,
+): { tenantId: string; redirectOrigin: string; syncMode: SyncMode } {
+  if (!state) {
+    throw new OAuthTenantError("Missing OAuth state");
+  }
+
+  let tenantId = "";
+  let redirectOrigin = DEFAULT_FRONTEND_URL;
+  let syncMode: SyncMode = "full";
+  try {
+    const parsed = JSON.parse(atob(state)) as { t?: string; o?: string; m?: string };
+    tenantId = parsed.t?.trim() ?? "";
+    if (parsed.o && ALLOWED_FRONTEND_ORIGINS.includes(parsed.o)) {
+      redirectOrigin = parsed.o;
+    }
+    if (parsed.m === "new") syncMode = "new";
+  } catch {
+    // Back-compat: older links encoded state as a bare tenant_id UUID.
+    tenantId = state.trim();
+  }
+
   if (!tenantId || !isUuid(tenantId)) {
     throw new OAuthTenantError("Missing or invalid OAuth state (tenant_id)");
   }
-  return tenantId;
-}
-
-function escapeHtml(text: string): string {
-  return text
-    .replaceAll("&", "&amp;")
-    .replaceAll("<", "&lt;")
-    .replaceAll(">", "&gt;")
-    .replaceAll('"', "&quot;")
-    .replaceAll("'", "&#39;");
+  return { tenantId, redirectOrigin, syncMode };
 }
 
 /**
- * HTML response for OAuth popup completion.
- * Posts { type: 'locus:source-oauth', source, success, error? } to opener, then closes.
+ * Redirects the OAuth popup back to a page on the frontend's own origin,
+ * which reads the query params and does the postMessage(opener) + close().
  *
- * Optional secret OAUTH_POPUP_TARGET_ORIGIN restricts postMessage target
- * (defaults to "*" so any opener can receive the event).
+ * Supabase Edge Functions on the default *.supabase.co domain cannot serve
+ * HTML at all — the gateway unconditionally rewrites any text/html response
+ * to text/plain (confirmed live: the Response object here can set whatever
+ * Content-Type it wants, the platform overrides it regardless), so an
+ * inline <script> never executes and the popup never closes itself. This
+ * redirects to the caller's own origin instead (resolved via
+ * resolveRedirectOrigin/parseTenantState against ALLOWED_FRONTEND_ORIGINS),
+ * where the page is a normal SPA route with no such restriction.
  */
 export function popupCallbackResponse(
   source: SourceKind,
   options: { success: boolean; error?: string; status?: number },
+  redirectOrigin: string = DEFAULT_FRONTEND_URL,
 ): Response {
-  const payload = {
-    type: "locus:source-oauth",
-    source,
-    success: options.success,
-    ...(options.error ? { error: options.error } : {}),
-  };
+  const redirectUrl = new URL("/oauth/source-callback", redirectOrigin);
+  redirectUrl.searchParams.set("source", source);
+  redirectUrl.searchParams.set("success", String(options.success));
+  if (options.error) redirectUrl.searchParams.set("error", options.error);
 
-  // Prevent </script> breakout if an error string ever contains HTML-ish text.
-  const payloadJson = JSON.stringify(payload).replaceAll("<", "\\u003c");
-  const targetOrigin = Deno.env.get("OAUTH_POPUP_TARGET_ORIGIN") ?? "*";
-  const targetOriginJson = JSON.stringify(targetOrigin);
-
-  const visibleMessage = options.success
-    ? `${source[0]!.toUpperCase()}${source.slice(1)} connected successfully. You can close this window.`
-    : (options.error ?? "Connection failed. You can close this window.");
-
-  const html = `<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="utf-8" />
-  <title>Locus OAuth</title>
-</head>
-<body>
-  <p>${escapeHtml(visibleMessage)}</p>
-  <script>
-    (function () {
-      var payload = ${payloadJson};
-      var targetOrigin = ${targetOriginJson};
-      try {
-        if (window.opener) {
-          window.opener.postMessage(payload, targetOrigin);
-        }
-      } catch (e) {}
-      window.close();
-    })();
-  </script>
-</body>
-</html>`;
-
-  return new Response(html, {
-    status: options.status ?? (options.success ? 200 : 400),
-    headers: { "Content-Type": "text/html; charset=utf-8" },
-  });
+  return Response.redirect(redirectUrl.toString(), 302);
 }
 
 export function authorizeErrorResponse(
   source: SourceKind,
   err: unknown,
+  redirectOrigin: string = DEFAULT_FRONTEND_URL,
 ): Response {
   if (err instanceof OAuthTenantError) {
     return popupCallbackResponse(source, {
       success: false,
       error: err.message,
       status: err.status,
-    });
+    }, redirectOrigin);
   }
 
   const message = err instanceof Error ? err.message : String(err);
@@ -166,5 +187,5 @@ export function authorizeErrorResponse(
     success: false,
     error: message,
     status: 500,
-  });
+  }, redirectOrigin);
 }

@@ -1,16 +1,14 @@
 import { useEffect, useMemo, useState } from 'react'
 import { Link } from 'react-router-dom'
-import {
-  MemoryRecordDetail,
-  createDefaultMemoryRecord,
-  type MemoryRecord,
-  type MemoryRecordType,
-} from '../components/MemoryRecordDetail'
+import { getDigest, listAllDecisions, type DecisionOut, type DecisionRecordType } from '../lib/api'
+import { decisionToMemoryRecord } from '../lib/memoryRecord'
+import { MemoryRecordDetail } from '../components/MemoryRecordDetail'
+import { TEAM_PULSE_SEEN_EVENT, TEAM_PULSE_SEEN_KEY } from '../lib/sessionKeys'
 
 type PulseSection = {
   count: number
   description: string
-  items: string[]
+  items: DecisionOut[]
 }
 
 type TeamPulseData = {
@@ -19,35 +17,32 @@ type TeamPulseData = {
   blockers: PulseSection
 }
 
-const FALLBACK_PULSE: TeamPulseData = {
-  decisions: {
-    count: 5,
-    description: 'Top 3 by confidence and recency, with 2 more below',
-    items: [
-      'Q3 ship date moved to July 29 after the design review conflict surfaced',
-      'Engineering confirmed the two-week buffer is enough. No scope cuts are needed',
-      'Client will be told proactively about the date change, not at the next check-in',
-    ],
-  },
-  actionItems: {
-    count: 3,
-    description: 'All 3 captured this week shown',
-    items: [
-      'Notify client services of the revised July 29 launch date',
-      'Update sprint calendar to reflect shifted milestones',
-      'Update public release notes once the date is finalized internally',
-    ],
-  },
-  blockers: {
-    count: 1,
-    description: 'Only blocker still active as of Sunday night',
-    items: ['Design review still blocked pending legal sign-off on new copy'],
-  },
+const SECTION_LABELS: Record<DecisionRecordType, { singular: string; plural: string }> = {
+  decision: { singular: 'decision', plural: 'decisions' },
+  action_item: { singular: 'action item', plural: 'action items' },
+  blocker: { singular: 'blocker', plural: 'blockers' },
+}
+
+function sectionDescription(type: DecisionRecordType, total: number, shown: number) {
+  const { singular, plural } = SECTION_LABELS[type]
+  if (total === 0) return `No ${plural} in this range`
+  if (total <= shown) return `All ${total} ${total === 1 ? singular : plural} shown`
+  return `Top ${shown} by confidence and recency, with ${total - shown} more not shown`
+}
+
+function buildSection(decisions: DecisionOut[], type: DecisionRecordType): PulseSection {
+  const matches = decisions
+    .filter((decision) => decision.record_type === type)
+    .sort((a, b) => b.confidence - a.confidence)
+  const shown = matches.slice(0, 3)
+  return {
+    count: matches.length,
+    description: sectionDescription(type, matches.length, shown.length),
+    items: shown,
+  }
 }
 
 const DAY_IN_MS = 24 * 60 * 60 * 1000
-const TEAM_PULSE_ENDPOINT =
-  import.meta.env.VITE_TEAM_PULSE_API_URL || '/api/team-pulse'
 
 function startOfWeek(date: Date) {
   const result = new Date(date.getFullYear(), date.getMonth(), date.getDate())
@@ -95,57 +90,14 @@ function getIsoWeek(date: Date) {
   return Math.ceil(((target.getTime() - yearStart.getTime()) / DAY_IN_MS + 1) / 7)
 }
 
-function isPulseSection(value: unknown): value is PulseSection {
-  if (!value || typeof value !== 'object') return false
-  const section = value as Partial<PulseSection>
-  return (
-    typeof section.count === 'number' &&
-    typeof section.description === 'string' &&
-    Array.isArray(section.items) &&
-    section.items.every((item) => typeof item === 'string')
-  )
-}
-
-function isTeamPulseData(value: unknown): value is TeamPulseData {
-  if (!value || typeof value !== 'object') return false
-  const pulse = value as Partial<TeamPulseData>
-  return (
-    isPulseSection(pulse.decisions) &&
-    isPulseSection(pulse.actionItems) &&
-    isPulseSection(pulse.blockers)
-  )
-}
-
-function pulseItemToRecord(
-  item: string,
-  index: number,
-  type: MemoryRecordType,
-): MemoryRecord {
-  return createDefaultMemoryRecord({
-    id: `pulse-${type}-${index}`,
-    type,
-    title: item,
-    summary: item,
-    meta: 'Slack · this week',
-    confidence:
-      type === 'Blocker'
-        ? '0.81, open blocker'
-        : type === 'Action Item'
-          ? '0.88, assigned action'
-          : '0.92, confirmed decision',
-  })
-}
-
 function PulseGroup({
   title,
   color,
   section,
-  recordType,
 }: {
   title: string
   color: string
   section: PulseSection
-  recordType: MemoryRecordType
 }) {
   const [expandedId, setExpandedId] = useState<string | null>(null)
 
@@ -164,16 +116,16 @@ function PulseGroup({
           {section.description}
         </p>
         <ul className="mt-2 space-y-1.5">
-          {section.items.map((item, index) => {
-            const record = pulseItemToRecord(item, index, recordType)
-            const isExpanded = expandedId === record.id
+          {section.items.map((decision) => {
+            const record = decisionToMemoryRecord(decision)
+            const isExpanded = expandedId === decision.id
             return (
-              <li key={record.id}>
+              <li key={decision.id}>
                 <button
                   type="button"
                   onClick={() =>
                     setExpandedId((current) =>
-                      current === record.id ? null : record.id,
+                      current === decision.id ? null : decision.id,
                     )
                   }
                   className={`flex w-full text-left text-[13px] leading-5 transition-colors ${
@@ -186,7 +138,7 @@ function PulseGroup({
                   <span className="mr-2.5 text-[#9197A5]" aria-hidden="true">
                     •
                   </span>
-                  <span>{item}</span>
+                  <span>{decision.decision_statement}</span>
                 </button>
                 {isExpanded ? (
                   <div className="mt-2 rounded-xl border border-[#E8E8ED] bg-[#FAFAFB] p-4">
@@ -226,8 +178,33 @@ export default function TeamPulse() {
   const [draftStart, setDraftStart] = useState(toInputDate(currentWeekStart))
   const [draftEnd, setDraftEnd] = useState(toInputDate(currentWeekEnd))
   const [isRangePickerOpen, setIsRangePickerOpen] = useState(false)
-  const [pulse, setPulse] = useState(FALLBACK_PULSE)
+  const [pulse, setPulse] = useState<TeamPulseData | null>(null)
+  const [isLoading, setIsLoading] = useState(true)
+  const [loadError, setLoadError] = useState('')
   const [feedback, setFeedback] = useState<'up' | 'down' | null>(null)
+  // The page's own copy promises "your week, synthesized" - previously
+  // nothing on the page was actually synthesized, just a client-side
+  // record_type/date filter over the raw decision list. GET /digest?scope=team
+  // (real Claude-generated summary, persisted per ISO week in weekly_digests)
+  // is only ever generated fresh for the current week server-side; any other
+  // week is served strictly from whatever's already cached, since retrieval
+  // isn't date-filtered. It's fetched alongside the existing per-item list
+  // rather than replacing it - the items below still come from
+  // listAllDecisions() so they keep full fidelity (real participant names,
+  // clickable through to full memory detail) that the lighter digest
+  // response doesn't carry.
+  const [digestSummary, setDigestSummary] = useState('')
+  const [isDigestLoading, setIsDigestLoading] = useState(false)
+
+  // Was a static `badge: true` on the nav link, always on regardless of
+  // whether Team Pulse had ever actually been opened - this is what marks
+  // it seen, once, when the page is actually visited.
+  useEffect(() => {
+    if (localStorage.getItem(TEAM_PULSE_SEEN_KEY)) return
+    localStorage.setItem(TEAM_PULSE_SEEN_KEY, 'true')
+    window.dispatchEvent(new Event(TEAM_PULSE_SEEN_EVENT))
+  }, [])
+
   const rangeDays = Math.round((rangeEnd.getTime() - rangeStart.getTime()) / DAY_IN_MS) + 1
   const isFullWeek = rangeDays === 7 && rangeStart.getDay() === 1
   const isCurrentWeek =
@@ -239,28 +216,78 @@ export default function TeamPulse() {
       ? 'Selected Week'
       : 'Selected Date Range'
 
+  // Real backend has no per-range digest endpoint (GET /digest only covers
+  // the current ISO week), so the actual per-item list - for any range,
+  // including the current week - still pulls every decision the tenant has
+  // via GET /api/v1/decisions and filters by record_type + created_at
+  // client side, real data for whatever range the picker above selects.
   useEffect(() => {
-    const controller = new AbortController()
-    const params = new URLSearchParams({
-      start_date: toInputDate(rangeStart),
-      end_date: toInputDate(rangeEnd),
-    })
+    let active = true
+    setIsLoading(true)
+    setLoadError('')
 
-    void fetch(`${TEAM_PULSE_ENDPOINT}?${params}`, { signal: controller.signal })
-      .then((response) => {
-        if (!response.ok) throw new Error('Team Pulse data is unavailable')
-        return response.json() as Promise<unknown>
+    const rangeStartMs = rangeStart.getTime()
+    const rangeEndMs = addDays(rangeEnd, 1).getTime()
+
+    void listAllDecisions()
+      .then((decisions) => {
+        if (!active) return
+        const inRange = decisions.filter((decision) => {
+          const createdAt = new Date(decision.created_at).getTime()
+          return createdAt >= rangeStartMs && createdAt < rangeEndMs
+        })
+        setPulse({
+          decisions: buildSection(inRange, 'decision'),
+          actionItems: buildSection(inRange, 'action_item'),
+          blockers: buildSection(inRange, 'blocker'),
+        })
       })
-      .then((data) => {
-        if (isTeamPulseData(data)) setPulse(data)
+      .catch(() => {
+        if (active) setLoadError('Unable to load Team Pulse data.')
       })
-      .catch((error: unknown) => {
-        if (error instanceof DOMException && error.name === 'AbortError') return
-        setPulse(FALLBACK_PULSE)
+      .finally(() => {
+        if (active) setIsLoading(false)
       })
 
-    return () => controller.abort()
+    return () => {
+      active = false
+    }
   }, [rangeEnd, rangeStart])
+
+  // The actual synthesized summary. Only meaningful for a full Mon-Sun
+  // week (a custom partial range from the date picker doesn't map to one
+  // ISO week), and only ever generated fresh for the CURRENT week - the
+  // backend serves any other week strictly from whatever's already cached
+  // in weekly_digests, since retrieval isn't date-filtered and regenerating
+  // for a past week would just mislabel today's top matches with an old
+  // date range. That means: from here on, every week that gets visited
+  // while it's current stays available when you navigate back to it later;
+  // a week nobody opened Team Pulse during (including every week before
+  // this existed) has nothing cached and correctly shows nothing.
+  useEffect(() => {
+    if (!isFullWeek) {
+      setDigestSummary('')
+      return
+    }
+    let active = true
+    setIsDigestLoading(true)
+    getDigest('team', false, toInputDate(rangeStart))
+      .then((digest) => {
+        if (active) setDigestSummary(digest.summary)
+      })
+      .catch(() => {
+        // Fails quietly (also the expected path for a past week with no
+        // cached digest, a plain 404) - the per-item breakdown below still
+        // loads independently and is the more load-bearing part of the page.
+        if (active) setDigestSummary('')
+      })
+      .finally(() => {
+        if (active) setIsDigestLoading(false)
+      })
+    return () => {
+      active = false
+    }
+  }, [isFullWeek, rangeStart])
 
   const moveRange = (amount: number) => {
     const dayOffset = amount * rangeDays
@@ -395,24 +422,30 @@ export default function TeamPulse() {
           </header>
 
           <div className="min-h-[405px] space-y-7 px-6 py-5">
-            <PulseGroup
-              title="Decisions"
-              color="#5644DF"
-              section={pulse.decisions}
-              recordType="Decision"
-            />
-            <PulseGroup
-              title="Action items"
-              color="#9CDD24"
-              section={pulse.actionItems}
-              recordType="Action Item"
-            />
-            <PulseGroup
-              title="Blockers"
-              color="#F3464B"
-              section={pulse.blockers}
-              recordType="Blocker"
-            />
+            {isLoading ? (
+              <p className="text-[14px] text-[#858B9B]">Loading Team Pulse…</p>
+            ) : loadError ? (
+              <p role="alert" className="text-[14px] text-[#B4232C]">
+                {loadError}
+              </p>
+            ) : pulse ? (
+              <>
+                {isFullWeek ? (
+                  isDigestLoading ? (
+                    <p className="text-[13px] italic text-[#9CA3AF]">
+                      {isCurrentWeek ? 'Synthesizing this week…' : 'Loading…'}
+                    </p>
+                  ) : digestSummary ? (
+                    <p className="whitespace-pre-wrap rounded-[6px] bg-[#F7F7FB] p-4 text-[14px] leading-relaxed text-[#3F424C]">
+                      {digestSummary}
+                    </p>
+                  ) : null
+                ) : null}
+                <PulseGroup title="Decisions" color="#5644DF" section={pulse.decisions} />
+                <PulseGroup title="Action items" color="#9CDD24" section={pulse.actionItems} />
+                <PulseGroup title="Blockers" color="#F3464B" section={pulse.blockers} />
+              </>
+            ) : null}
           </div>
 
           <footer className="flex h-[58px] items-center justify-between border-t border-[#E6E7EC] px-6">

@@ -1,3 +1,6 @@
+import { useEffect, useState, type ReactElement } from 'react'
+import { listAllDecisions } from '../lib/api'
+
 function GavelIcon() {
   return (
     <svg width="18" height="18" viewBox="0 0 24 24" fill="none" aria-hidden="true">
@@ -54,24 +57,26 @@ function WarningIcon() {
   )
 }
 
-const STATS = [
+type StatKey = 'decision' | 'action_item' | 'blocker'
+
+const STAT_META: { key: StatKey; label: string; valueClass: string; iconBg: string; icon: ReactElement }[] = [
   {
+    key: 'decision',
     label: 'Decisions',
-    value: '7',
     valueClass: 'text-[#5A45FF]',
     iconBg: 'bg-[#EEEBFF]',
     icon: <GavelIcon />,
   },
   {
+    key: 'action_item',
     label: 'Action Items',
-    value: '7',
     valueClass: 'text-[#111827]',
     iconBg: 'bg-[#ECFCCB]',
     icon: <CheckIcon />,
   },
   {
+    key: 'blocker',
     label: 'Blockers',
-    value: '7',
     valueClass: 'text-[#DC2626]',
     iconBg: 'bg-[#FEE2E2]',
     icon: <WarningIcon />,
@@ -79,11 +84,36 @@ const STATS = [
 ]
 
 export function DashboardStats() {
+  const [counts, setCounts] = useState<Record<StatKey, number> | null>(null)
+
+  useEffect(() => {
+    let active = true
+
+    void listAllDecisions()
+      .then((decisions) => {
+        if (!active) return
+        const next: Record<StatKey, number> = { decision: 0, action_item: 0, blocker: 0 }
+        for (const decision of decisions) {
+          if (decision.record_type === 'decision' || decision.record_type === 'action_item' || decision.record_type === 'blocker') {
+            next[decision.record_type] += 1
+          }
+        }
+        setCounts(next)
+      })
+      .catch(() => {
+        if (active) setCounts({ decision: 0, action_item: 0, blocker: 0 })
+      })
+
+    return () => {
+      active = false
+    }
+  }, [])
+
   return (
     <section className="mb-8 grid grid-cols-3 gap-4">
-      {STATS.map((stat) => (
+      {STAT_META.map((stat) => (
         <div
-          key={stat.label}
+          key={stat.key}
           className="rounded-2xl border border-[#E8E8ED] bg-white p-5 shadow-[0_1px_2px_rgba(16,24,40,0.04)]"
         >
           <div className="mb-3 flex items-start justify-between">
@@ -97,7 +127,7 @@ export function DashboardStats() {
             </div>
           </div>
           <p className={`text-[40px] font-bold leading-none tracking-[-0.03em] ${stat.valueClass}`}>
-            {stat.value}
+            {counts === null ? '—' : counts[stat.key]}
           </p>
         </div>
       ))}

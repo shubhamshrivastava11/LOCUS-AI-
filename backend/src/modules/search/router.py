@@ -45,7 +45,7 @@ async def search_endpoint(
 ) -> SearchResponse:
     """Production question -> grounded answer + citations endpoint."""
     pool = get_db_pool()
-    permission_scopes = resolve_permission_scopes(ctx)
+    permission_scopes = await resolve_permission_scopes(ctx)
     try:
         return await search(
             pool,

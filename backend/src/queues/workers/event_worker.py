@@ -32,21 +32,30 @@ log = logging.getLogger(__name__)
 
 VISIBILITY_TIMEOUT_SECONDS = 60
 POLL_INTERVAL_SECONDS = 2
+BATCH_SIZE = 20
 
 
 async def run_event_worker() -> None:
-    """Long-running worker loop: read -> process -> delete from the ingestion queue."""
+    """Long-running worker loop: read -> process -> delete from the ingestion queue.
+
+    Messages in a batch are handled concurrently (asyncio.gather), not one
+    at a time - each _handle_message() call is DB/AI-pipeline-bound, so
+    processing them sequentially left the DB pool (max_size configured well
+    above 1) and Claude/Voyage clients almost entirely idle between round
+    trips. Concurrency is naturally capped by the pool's max_size: extra
+    acquire() calls beyond that just queue, they don't error.
+    """
     client = get_pgmq_client()
     pool = get_db_pool()
     log.info("Event worker started - polling %s", QueueName.INGESTION)
 
     while True:
         messages = await client.read(
-            QueueName.INGESTION, vt=VISIBILITY_TIMEOUT_SECONDS, batch=5
+            QueueName.INGESTION, vt=VISIBILITY_TIMEOUT_SECONDS, batch=BATCH_SIZE
         )
-        for msg in messages:
-            await _handle_message(client, pool, msg)
-        if not messages:
+        if messages:
+            await asyncio.gather(*(_handle_message(client, pool, msg) for msg in messages))
+        else:
             await asyncio.sleep(POLL_INTERVAL_SECONDS)
 
 

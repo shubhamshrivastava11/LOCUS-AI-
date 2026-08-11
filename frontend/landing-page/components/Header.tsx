@@ -20,7 +20,7 @@ export function Header() {
             href="#why-locus"
             className="text-[14px] font-medium text-[#6b7280] transition-colors hover:text-[#111827]"
           >
-            Why Locus
+            Why Locus AI
           </a>
         </nav>
 

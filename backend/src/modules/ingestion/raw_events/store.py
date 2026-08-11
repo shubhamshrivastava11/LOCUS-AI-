@@ -132,8 +132,40 @@ async def store_raw_event(
         )
 
     if row is None:
+        # ON CONFLICT DO NOTHING fires whenever a row already exists for this
+        # key, regardless of whether that row's pipeline ever finished. A row
+        # stuck at pipeline_status='pending' (crashed/interrupted first
+        # attempt) must NOT be treated the same as a truly-completed
+        # duplicate - doing so is exactly what was silently discarding every
+        # retry system-wide (see modules.ingestion.dedup.ledger.is_duplicate's
+        # docstring for the first half of this bug). Look up the existing
+        # row and only report "no id" for a row that's actually done;
+        # otherwise hand back its id so the caller retries the pipeline
+        # against it instead of losing the message.
+        async with tenant_conn(get_db_pool(), tenant_id) as lookup_conn:
+            existing = await lookup_conn.fetchrow(
+                """
+                select id, pipeline_status
+                from public.raw_events
+                where tenant_id = $1 and source = $2 and source_id = $3
+                """,
+                tenant_id,
+                source,
+                source_id,
+            )
+
+        if existing is not None and existing["pipeline_status"] == "pending":
+            log.info(
+                "store_raw_event conflict but pipeline never completed - "
+                "returning existing id for retry: source=%s source_id=%s raw_event_id=%s",
+                source,
+                source_id,
+                existing["id"],
+            )
+            return existing["id"]
+
         log.info(
-            "store_raw_event conflict (already present): source=%s source_id=%s",
+            "store_raw_event conflict (already present, done): source=%s source_id=%s",
             source,
             source_id,
         )

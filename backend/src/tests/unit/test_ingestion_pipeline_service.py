@@ -67,6 +67,7 @@ class TestDiscardSkipsPersistenceAndEnqueue:
             ),
             patch("modules.ai.pipeline.service.persist_decision_from_extraction", AsyncMock()) as persist_mock,
             patch("modules.ai.pipeline.service.enqueue_embedding_job", AsyncMock()) as enqueue_mock,
+            patch("modules.ai.pipeline.service.mark_processed", AsyncMock()) as mark_processed_mock,
         ):
             result = await process_and_persist_event(object(), _event(), RAW_EVENT_ID)
 
@@ -75,6 +76,7 @@ class TestDiscardSkipsPersistenceAndEnqueue:
         assert result.decision_id is None
         persist_mock.assert_not_awaited()
         enqueue_mock.assert_not_awaited()
+        mark_processed_mock.assert_awaited_once_with(TENANT, RAW_EVENT_ID)
 
 
 class TestKeepPersistsAndEnqueues:
@@ -95,6 +97,7 @@ class TestKeepPersistsAndEnqueues:
             patch(
                 "modules.ai.pipeline.service.enqueue_embedding_job", AsyncMock(return_value=1)
             ) as enqueue_mock,
+            patch("modules.ai.pipeline.service.mark_processed", AsyncMock()) as mark_processed_mock,
         ):
             result = await process_and_persist_event(object(), _event(), RAW_EVENT_ID)
 
@@ -103,6 +106,7 @@ class TestKeepPersistsAndEnqueues:
         assert result.decision_id == DECISION_ID
         persist_mock.assert_awaited_once()
         enqueue_mock.assert_awaited_once_with(tenant_id=TENANT, decision_id=DECISION_ID)
+        mark_processed_mock.assert_awaited_once_with(TENANT, RAW_EVENT_ID)
 
     async def test_embedding_job_is_enqueued_only_after_persistence_commits(self):
         """Ordering proof: enqueue must never be called before persist
@@ -113,6 +117,9 @@ class TestKeepPersistsAndEnqueues:
         async def fake_persist(*args, **kwargs):
             call_order.append("persist")
             return DECISION_ID
+
+        async def fake_mark_processed(*args, **kwargs):
+            call_order.append("mark_processed")
 
         async def fake_enqueue(*args, **kwargs):
             call_order.append("enqueue")
@@ -128,11 +135,12 @@ class TestKeepPersistsAndEnqueues:
                 ),
             ),
             patch("modules.ai.pipeline.service.persist_decision_from_extraction", fake_persist),
+            patch("modules.ai.pipeline.service.mark_processed", fake_mark_processed),
             patch("modules.ai.pipeline.service.enqueue_embedding_job", fake_enqueue),
         ):
             await process_and_persist_event(object(), _event(), RAW_EVENT_ID)
 
-        assert call_order == ["persist", "enqueue"]
+        assert call_order == ["persist", "mark_processed", "enqueue"]
 
 
 class TestUncertainAlsoPersists:
@@ -151,6 +159,7 @@ class TestUncertainAlsoPersists:
                 AsyncMock(return_value=DECISION_ID),
             ),
             patch("modules.ai.pipeline.service.enqueue_embedding_job", AsyncMock(return_value=1)),
+            patch("modules.ai.pipeline.service.mark_processed", AsyncMock()),
         ):
             result = await process_and_persist_event(object(), _event(), RAW_EVENT_ID)
 
@@ -206,6 +215,9 @@ class TestFailureWrapping:
                 "modules.ai.pipeline.service.enqueue_embedding_job",
                 AsyncMock(side_effect=EmbeddingEnqueueError("queue down")),
             ),
+            patch("modules.ai.pipeline.service.mark_processed", AsyncMock()) as mark_processed_mock,
         ):
             with pytest.raises(IngestionEmbeddingEnqueueError):
                 await process_and_persist_event(object(), _event(), RAW_EVENT_ID)
+
+        mark_processed_mock.assert_awaited_once_with(TENANT, RAW_EVENT_ID)

@@ -31,9 +31,18 @@ ANSWER_TOOL_NAME = "submit_answer"
 
 _MULTI_DOCUMENT_INSTRUCTION = (
     "This question likely spans multiple decisions. If more than one decision in the context "
-    "is relevant, structure your answer as a short list - one point per relevant decision, each "
-    "citing its decision number - followed by a one-sentence overall summary. Do not merge "
-    "distinct decisions into one statement if they are actually separate."
+    "is relevant, structure your answer as a short list in plain text - one sentence per "
+    "relevant decision, each citing its decision number - followed by a one-sentence overall "
+    "summary. Do not merge distinct decisions into one statement if they are actually separate."
+)
+
+_FORMATTING_RULES = (
+    "- Plain prose only: never use markdown syntax (no **bold**, no # headings, no bullet or "
+    "numbered list characters). The frontend displays this text as-is, so any markdown "
+    "punctuation shows up literally to the reader instead of being rendered. Structure with "
+    "plain sentences and paragraph breaks instead.\n"
+    "- Never use an em dash (—) or double hyphen (--). Use a period, comma, colon, or \"and\"/"
+    "\"but\" to join or separate clauses instead."
 )
 
 SYSTEM_PROMPT_TEMPLATE = """You are Locus AI, answering questions about a company's recorded \
@@ -56,6 +65,7 @@ adjacent or topically similar) should you explain both viewpoints instead of sil
 - Set sufficient_evidence to false ONLY when no decision in the context actually answers the \
 question. Do not refuse merely because multiple related decisions exist, but do not guess or \
 partially answer from outside knowledge when the context genuinely lacks a supporting decision.
+{formatting_rules}
 {multi_document_instruction}
 Call the submit_answer tool exactly once with your response."""
 
@@ -72,7 +82,9 @@ def build_system_prompt(query_analysis: QueryAnalysis | None) -> str:
         if (_is_real_analysis(query_analysis) and query_analysis.is_multi_document)
         else ""
     )
-    return SYSTEM_PROMPT_TEMPLATE.format(multi_document_instruction=instruction)
+    return SYSTEM_PROMPT_TEMPLATE.format(
+        formatting_rules=_FORMATTING_RULES, multi_document_instruction=instruction
+    )
 
 
 def build_user_message(question: str, context: str, query_analysis: QueryAnalysis | None) -> str:

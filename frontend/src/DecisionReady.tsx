@@ -1,4 +1,5 @@
 import React, { useEffect, useState } from "react";
+import { Link } from "react-router-dom";
 import logoSrc from "./assets/locuslogo.png";
 
 
@@ -17,12 +18,12 @@ interface DecisionReadyProps {
 }
 
 const LocusLogo: React.FC = () => (
-  <div className="flex items-center justify-center gap-2">
+  <Link to="/" className="flex items-center justify-center gap-2" aria-label="Locus AI home">
     <img src={logoSrc} alt="Locus AI" className="h-8 w-8 rounded-[6px]" />
     <span className="text-lg font-bold text-gray-900">
       LOCUS <span className="text-[#5b52e8]">AI</span>
     </span>
-  </div>
+  </Link>
 );
 
 const GoogleIcon: React.FC = () => (

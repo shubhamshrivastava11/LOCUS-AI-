@@ -66,7 +66,7 @@ async def _stream_search_result(question: str, ctx: TenantContext, pool, top_k: 
     streaming would reintroduce exactly the duplication this change removes.
     """
     try:
-        permission_scopes = resolve_permission_scopes(ctx)
+        permission_scopes = await resolve_permission_scopes(ctx)
         result = await run_search_pipeline(pool, ctx.tenant_id, question, permission_scopes, top_k)
 
         # result.answer is always populated by modules.answering.service.generate_answer()

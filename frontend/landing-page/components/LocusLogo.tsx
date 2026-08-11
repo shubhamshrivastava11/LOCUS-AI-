@@ -1,3 +1,5 @@
+import logoSrc from '../assets/locuslogo.png'
+
 export function LocusLogo({
   className = '',
   variant = 'dark',
@@ -7,13 +9,13 @@ export function LocusLogo({
   variant?: 'dark' | 'light'
   size?: number
 }) {
-  const textColor = variant === 'light' ? 'text-white' : 'text-black'
+  const textColor = variant === 'light' ? 'text-white' : 'text-[#374151]'
 
   return (
     <div className={`flex items-center gap-2.5 ${className}`}>
       <img
-        src="/locus-mark.png"
-        alt=""
+        src={logoSrc}
+        alt="Locus AI"
         width={size}
         height={size}
         className="shrink-0 rounded-[6px]"

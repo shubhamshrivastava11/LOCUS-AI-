@@ -34,7 +34,7 @@ log = logging.getLogger(__name__)
 
 VISIBILITY_TIMEOUT_SECONDS = 60
 POLL_INTERVAL_SECONDS = 2
-BATCH_SIZE = 5
+BATCH_SIZE = 20
 
 # Failures that will never succeed on retry. Still left in the queue (no
 # delete-on-failure path exists), but logged distinctly from a transient
@@ -52,9 +52,9 @@ async def run_embedding_worker() -> None:
         messages = await client.read(
             QueueName.EMBEDDING, vt=VISIBILITY_TIMEOUT_SECONDS, batch=BATCH_SIZE
         )
-        for msg in messages:
-            await _handle_message(client, pool, msg)
-        if not messages:
+        if messages:
+            await asyncio.gather(*(_handle_message(client, pool, msg) for msg in messages))
+        else:
             await asyncio.sleep(POLL_INTERVAL_SECONDS)
 
 
