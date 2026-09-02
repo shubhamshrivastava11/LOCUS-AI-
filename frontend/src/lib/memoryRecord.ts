@@ -1,10 +1,20 @@
-import type { DecisionOut, DecisionRecordType } from './api'
+import type { DecisionOut, DecisionRecordType, CanonicalMemory, MemoryType } from './api'
 import type { MemoryRecord, MemoryRecordType } from '../components/MemoryRecordDetail'
 
 const RECORD_TYPE_LABELS: Record<DecisionRecordType, MemoryRecordType> = {
   decision: 'Decision',
   action_item: 'Action Item',
   blocker: 'Blocker',
+}
+
+// CanonicalMemory's 3-type taxonomy maps onto MemoryRecordDetail's existing
+// display types - Commitment is the same concept the old pipeline called
+// action_item, so it reuses that same "Action Item" badge/color rather than
+// adding a fourth visual type for what's semantically the same thing.
+const MEMORY_TYPE_LABELS: Record<MemoryType, MemoryRecordType> = {
+  Decision: 'Decision',
+  Commitment: 'Action Item',
+  Blocker: 'Blocker',
 }
 
 export const PLATFORM_LABELS: Record<string, string> = {
@@ -76,5 +86,34 @@ export function decisionToMemoryRecord(decision: DecisionOut): MemoryRecord {
     date: formatDate(decision.created_at),
     sourceLink: decision.source_links[0],
     exactTime: formatExactTime(decision.created_at),
+  }
+}
+
+/**
+ * Adapts a real CanonicalMemory row (ai-worker's direct-to-memories write
+ * path, memory-explorer upgrade) into the same MemoryRecordDetail display
+ * shape decisionToMemoryRecord produces - the dashboard's "Build Memory"
+ * list and search-suggestion chips read memories now that ai-worker no
+ * longer writes to public.decisions at all.
+ */
+export function memoryToMemoryRecord(memory: CanonicalMemory): MemoryRecord {
+  const type = MEMORY_TYPE_LABELS[memory.type] ?? 'Decision'
+  const platform = memory.source_events[0]?.source
+  const platformLabel = platform ? PLATFORM_LABELS[platform] ?? platform : 'Unknown source'
+  const people = memory.entities.filter((e) => e.entity_type === 'Person')
+
+  return {
+    id: memory.memory_id,
+    type,
+    title: memory.title,
+    meta: `${platformLabel} · ${timeAgo(memory.observed_at)}`,
+    summary: memory.summary || memory.title,
+    participants: people.length > 0 ? people.map((p) => p.canonical_name).join(', ') : 'Not recorded',
+    source: platformLabel,
+    status: memory.status === 'current' || memory.status === 'proposed' ? 'Current' : 'Superseded',
+    listSource: platformLabel,
+    date: formatDate(memory.occurred_at),
+    sourceLink: memory.source_events[0]?.url ?? undefined,
+    exactTime: formatExactTime(memory.occurred_at),
   }
 }

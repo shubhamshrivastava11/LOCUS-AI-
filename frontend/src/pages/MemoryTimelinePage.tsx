@@ -52,19 +52,15 @@ type TypeFilter = typeof ALL_TYPES | MemoryType
 type SourceFilter = typeof ALL_SOURCES | string
 type StatusFilter = typeof ALL_STATUSES | MemoryStatus
 
-// Browse mode's grouping (spec: "People, Projects, Teams, Systems &
-// Topics, Customers, only rendering non-empty groups"). Product doesn't
-// have its own named group in the spec - folded into the closest existing
-// bucket (Systems & Topics) rather than inventing a 6th group, since it's
-// rare enough in practice not to need its own shelf, and the "only
-// non-empty groups" rule already keeps an all-Product tenant from being
-// stuck with a silently-missing type.
+// Browse mode's grouping, narrowed to the memory-explorer upgrade's 3
+// relational entity types. Systems/Topics/Products/Customers are no longer
+// entities at all (see EntityType's comment) - they're memory.tags now,
+// so there's no shelf for them here; a tag isn't a thing you recenter the
+// timeline on the way an entity is.
 const ENTITY_GROUPS: { label: string; types: EntityType[] }[] = [
   { label: 'People', types: ['Person'] },
   { label: 'Projects', types: ['Project'] },
   { label: 'Teams', types: ['Team'] },
-  { label: 'Systems & Topics', types: ['System', 'Topic', 'Product'] },
-  { label: 'Customers', types: ['Customer'] },
 ]
 
 const ALL_GROUPS = 'All Types'
@@ -759,7 +755,7 @@ export default function MemoryTimelinePage() {
             className="h-9 rounded-lg border border-[#E5E7EB] px-2 text-[12px] text-[#374151]"
           >
             <option value={ALL_TYPES}>{ALL_TYPES}</option>
-            {(['Context', 'Change', 'Commitment', 'Decision', 'Rationale', 'Blocker', 'Outcome', 'Requirement', 'CustomerSignal'] as MemoryType[]).map((t) => (
+            {(['Decision', 'Commitment', 'Blocker'] as MemoryType[]).map((t) => (
               <option key={t} value={t}>
                 {t}
               </option>

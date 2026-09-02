@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react'
 import { getSupabaseClient } from '../lib/supabase'
-import { ApiError, getDecision, listDecisions, searchDecisions, type SearchResponse } from '../lib/api'
+import { ApiError, getDecision, listMemories, searchDecisions, type SearchResponse } from '../lib/api'
 import { DEMO_EMAIL_KEY } from '../lib/sessionKeys'
 import { decisionToMemoryRecord } from '../lib/memoryRecord'
 import { MemoryRecordDetail, type MemoryRecord } from './MemoryRecordDetail'
@@ -129,14 +129,20 @@ export function DashboardSearch() {
     })
   }, [])
 
-  // Suggestion chips reflect this tenant's own real decisions, not fixed
+  // Suggestion chips reflect this tenant's own real memories, not fixed
   // demo examples - a tenant with no captures yet just sees none, rather
-  // than examples that imply data that isn't there.
+  // than examples that imply data that isn't there. Was listDecisions(3, 0);
+  // ai-worker (memory-explorer upgrade) no longer writes to public.decisions
+  // at all, so that call would silently starve to zero suggestions for any
+  // tenant whose captures all postdate the upgrade. The actual answer engine
+  // below (searchDecisions) still reads public.decisions - that's a
+  // separate, larger migration (the full Loci query-pattern rework), not
+  // something this fix touches. This only reseeds the chip text.
   useEffect(() => {
     if (sessionStorage.getItem(DEMO_EMAIL_KEY)) return
-    listDecisions(3, 0)
+    listMemories()
       .then((response) => {
-        setSuggestions(response.items.map((item) => toSuggestion(item.decision_statement)))
+        setSuggestions(response.memories.slice(0, 3).map((m) => toSuggestion(m.title)))
       })
       .catch(() => {
         // No suggestions is a fine fallback - the search bar works without them.

@@ -1,19 +1,15 @@
 // supabase/functions/memory-api/index.ts
 //
-// Owns every endpoint for the new Memory Intelligence layer (plan:
-// C:\Users\L Lawliet\.claude\plans\steady-whistling-hearth.md). Kept
-// separate from the live, revenue-critical api/index.ts so nothing here
-// can regress today's /search, /digest, or /api/v1/decisions.
-//
-// BATCH 1: just POST /fixtures/load - loads hand-written or real-replayed
-// NormalizedEvents, runs them through extraction + a Batch-1-interim
-// entity resolution + the write path, no reconciliation yet (Batch 2).
+// Owns the read/action surface for the Memory Intelligence layer (entity
+// review queue, evidence, attention, resolve). As of the memory-explorer
+// upgrade, ai-worker is the sole ingestion engine - it writes directly to
+// public.memories - so this function no longer owns any write/ingestion
+// path of its own. The fixture-loader and real-replay debug endpoints that
+// used to live here were removed for that reason, not because ingestion
+// moved elsewhere; there is no elsewhere, ai-worker is it.
 
 import { withAdmin, withTenant } from "../_shared/db.ts";
 import { extractMemory, validatePayloadForType } from "../_shared/memory/extraction.ts";
-import { replayHistoricalEvents, extractEventText, type NormalizedEvent } from "../_shared/memory/historicalReplay.ts";
-import { byteaToUint8Array, decryptRawContent } from "../_shared/memory/crypto.ts";
-import { STARTER_EVENTS } from "../_shared/memory/fixtures/starterEvents.ts";
 import { resolveEntityMention, resolveReferencedMention, confirmNewEntity, mergeIntoExistingEntity, linkQueuedMentionsToMemory } from "../_shared/memory/entityResolution.ts";
 import { writeMemory, detectConflicts, classifyRelation, ZeroSourceEventsError } from "../_shared/memory/reconcile.ts";
 import { embedText } from "../_shared/memory/embeddings.ts";
@@ -50,253 +46,6 @@ function json(body: unknown, status = 200): Response {
 // used by slack-membership-sync) - moved so a second admin-only function
 // doesn't grow its own hand-copied, silently-drifting version.
 
-async function loadFixtureSet(fixtureSet: string, tenantId: string, perSourceLimit: number): Promise<NormalizedEvent[]> {
-  if (fixtureSet === "starter_events") {
-    return STARTER_EVENTS.map((e) => ({ ...e, tenant_id: tenantId }));
-  }
-  if (fixtureSet === "real_replay") {
-    return await replayHistoricalEvents(tenantId, perSourceLimit);
-  }
-  throw new Error(`Unknown fixture_set: ${fixtureSet}`);
-}
-
-interface LoadResult {
-  event_source_id: string;
-  event_source: string;
-  outcome: "memory_created" | "discarded" | "rejected_zero_sources" | "invalid_payload" | "error";
-  memory_id?: string;
-  memory_type?: string;
-  detail?: string;
-  queued_entity_mentions?: number;
-  reconciliation?: { relation: string; candidate_memory_id: string }[];
-}
-
-async function handleFixturesLoad(req: Request): Promise<Response> {
-  let body: { fixture_set?: string; tenant_id?: string; per_source_limit?: number };
-  try {
-    body = await req.json();
-  } catch {
-    return json({ detail: "Invalid JSON body" }, 400);
-  }
-  if (!body.tenant_id) return json({ detail: "tenant_id is required" }, 400);
-  if (!body.fixture_set) return json({ detail: "fixture_set is required" }, 400);
-
-  const tenantId = body.tenant_id;
-  // Kept small by default - each event costs one sequential Claude call
-  // plus embeddings, and this endpoint runs inside one edge function
-  // invocation's wall-clock limit, not a background job.
-  const perSourceLimit = body.per_source_limit ?? 5;
-  let events: NormalizedEvent[];
-  try {
-    events = await loadFixtureSet(body.fixture_set, tenantId, perSourceLimit);
-  } catch (err) {
-    return json({ detail: err instanceof Error ? err.message : String(err) }, 400);
-  }
-
-  const results: LoadResult[] = [];
-
-  for (const event of events) {
-    try {
-      await withTenant(tenantId, async (sql) => {
-        // Dedup on (tenant_id, source, source_id), same key raw_events uses.
-        const fixtureRows = await sql`
-          insert into public.memory_fixture_events (
-            tenant_id, source, source_id, actor_display_name, thread_ref,
-            permission_scope, raw_content, occurred_at
-          ) values (
-            ${tenantId}, ${event.source}, ${event.source_id}, ${event.actor.display_name},
-            ${event.thread_ref}, ${event.permission_scope}, ${event.raw_content}, ${event.occurred_at}
-          )
-          on conflict (tenant_id, source, source_id) do update set raw_content = excluded.raw_content
-          returning id
-        `;
-        const fixtureEventId = fixtureRows[0].id as string;
-
-        // Bug found and fixed during Checkpoint A follow-up: two replay
-        // calls with different per_source_limit values can both return the
-        // same underlying raw_events row. The insert above upserts the
-        // fixture_event row either way (correct - one row per source
-        // event), but without this guard, re-processing that same row
-        // re-ran extraction and wrote a SECOND memory for content already
-        // captured - confirmed live, two identical "App deployment
-        // problems resolved" memories from one Slack message. Skip
-        // extraction entirely once a fixture event already has a memory.
-        const alreadyProcessed = await sql`
-          select 1 from public.memory_source_events where fixture_event_id = ${fixtureEventId} limit 1
-        `;
-        if (alreadyProcessed.length > 0) {
-          results.push({ event_source_id: event.source_id, event_source: event.source, outcome: "discarded", detail: "already processed in a prior run" });
-          return;
-        }
-
-        const extraction = await extractMemory({
-          source: event.source,
-          actorDisplayName: event.actor.display_name,
-          threadRef: event.thread_ref,
-          permissionScope: event.permission_scope,
-          rawContent: event.raw_content,
-          occurredAt: event.occurred_at,
-        });
-
-        if (extraction.decision === "DISCARD" || !extraction.type) {
-          results.push({ event_source_id: event.source_id, event_source: event.source, outcome: "discarded" });
-          return;
-        }
-
-        const missing = validatePayloadForType(extraction.type, extraction.payload);
-        if (missing.length > 0) {
-          results.push({
-            event_source_id: event.source_id, event_source: event.source,
-            outcome: "invalid_payload", detail: `missing payload fields for ${extraction.type}: ${missing.join(", ")}`,
-          });
-          return;
-        }
-
-        // Batch 2 real entity resolution: exact match -> embedding
-        // similarity -> queue for review, never silently auto-create.
-        //
-        // Mentions extraction marked role="referenced" on a
-        // Project/System/Topic/Product/Customer type skip that pipeline
-        // entirely - a passing comparison or schedule label ("Phase 5",
-        // "matches the work he did on Gmail's OAuth") should link to an
-        // existing entity if one clearly matches and otherwise be dropped,
-        // never create a new entity or occupy a review-queue row. Person/
-        // Team mentions always take the full path regardless of role -
-        // real people and teams are worth tracking even when named only in
-        // passing (see extraction.ts's prompt for why).
-        const REFERENCE_ELIGIBLE_TYPES = new Set(["Project", "System", "Topic", "Product", "Customer"]);
-        const entityIds: string[] = [];
-        const queuedUnresolvedIds: string[] = [];
-        for (const mention of extraction.entities) {
-          if (mention.role === "referenced" && REFERENCE_ELIGIBLE_TYPES.has(mention.entity_type_guess)) {
-            const matchedId = await resolveReferencedMention(sql, tenantId, mention.mention_text, mention.entity_type_guess);
-            if (matchedId) entityIds.push(matchedId);
-            continue;
-          }
-          // The judgment tier reasons over this exact text - the memory's
-          // own generated title+summary, the same content a human reviewer
-          // would read to make the same call.
-          const mentionContext = `${extraction.title ?? ""}. ${extraction.summary ?? ""}`;
-          const resolved = await resolveEntityMention(sql, tenantId, mention.mention_text, mention.entity_type_guess, undefined, mentionContext);
-          if (resolved.entityId) entityIds.push(resolved.entityId);
-          else if (resolved.unresolvedId) queuedUnresolvedIds.push(resolved.unresolvedId);
-        }
-
-        const searchableText = `${extraction.type}: ${extraction.title}\n${extraction.summary}`;
-
-        try {
-          const memoryId = await writeMemory(sql, {
-            tenantId,
-            type: extraction.type,
-            title: extraction.title ?? "",
-            summary: extraction.summary ?? "",
-            payload: { ...extraction.payload, attribute_key: extraction.attribute_key },
-            entityIds,
-            occurredAt: event.occurred_at,
-            validFrom: extraction.valid_from ?? event.occurred_at,
-            confidence: extraction.confidence,
-            searchableText,
-            sourceEventIds: [fixtureEventId],
-            citations: [{ fixtureEventId, excerptRef: "full-content" }],
-          });
-
-          const embedding = await embedText(searchableText, "document");
-          await sql`
-            insert into public.memory_embeddings (memory_id, tenant_id, embedding, embedding_model)
-            values (${memoryId}, ${tenantId}, ${JSON.stringify(embedding)}, 'voyage-4-large')
-            on conflict (memory_id) do update set embedding = excluded.embedding
-          `;
-
-          // Now that memoryId actually exists, backfill it onto whichever
-          // mentions above got queued for review instead of auto-matched -
-          // see linkQueuedMentionsToMemory's own comment for why this can't
-          // happen at resolution time.
-          await linkQueuedMentionsToMemory(sql, queuedUnresolvedIds, memoryId);
-
-          const conflictResults = extraction.attribute_key ? await detectConflicts(sql, tenantId, memoryId) : [];
-
-          results.push({
-            event_source_id: event.source_id, event_source: event.source,
-            outcome: "memory_created", memory_id: memoryId, memory_type: extraction.type as MemoryType,
-            queued_entity_mentions: queuedUnresolvedIds.length,
-            reconciliation: conflictResults.map((r) => ({ relation: r.relation, candidate_memory_id: r.candidateMemoryId })),
-          });
-        } catch (err) {
-          if (err instanceof ZeroSourceEventsError) {
-            results.push({ event_source_id: event.source_id, event_source: event.source, outcome: "rejected_zero_sources" });
-          } else {
-            throw err;
-          }
-        }
-      });
-    } catch (err) {
-      console.error(`fixtures/load: failed on ${event.source}:${event.source_id}:`, err);
-      results.push({
-        event_source_id: event.source_id, event_source: event.source,
-        outcome: "error", detail: err instanceof Error ? err.message : String(err),
-      });
-    }
-  }
-
-  const summary = results.reduce((acc, r) => {
-    acc[r.outcome] = (acc[r.outcome] ?? 0) + 1;
-    return acc;
-  }, {} as Record<string, number>);
-
-  return json({ tenant_id: tenantId, fixture_set: body.fixture_set, total_events: events.length, summary, results });
-}
-
-// Diagnoses why a source contributed zero (or few) memories despite having
-// real raw_events - decrypts and runs the exact same extractEventText a
-// real replay would, WITHOUT calling Claude or writing anything, so the
-// question "did decryption fail, or did it decrypt to nothing useful, or
-// did extraction just judge it not memory-worthy" gets a real answer
-// instead of a guess. Read-only, admin pool.
-async function handleDebugInspectReplaySource(req: Request): Promise<Response> {
-  const body = await req.json() as { tenant_id?: string; source?: string; limit?: number };
-  if (!body.tenant_id || !body.source) return json({ detail: "tenant_id and source are required" }, 400);
-  const limit = Math.min(body.limit ?? 15, 50);
-
-  const rows = await withAdmin((sql) => sql`
-    select re.id, re.source_id, re.received_at, re.raw_content
-    from public.raw_events re
-    where re.tenant_id = ${body.tenant_id} and re.source = ${body.source}
-    order by re.received_at desc
-    limit ${limit}
-  `);
-
-  const inspected = await Promise.all(rows.map(async (row: Record<string, unknown>) => {
-    try {
-      const encrypted = byteaToUint8Array(row.raw_content);
-      const decrypted = await decryptRawContent(encrypted);
-      let parsed: unknown = decrypted;
-      try {
-        parsed = JSON.parse(decrypted);
-      } catch {
-        // plain text row, not a JSON envelope
-      }
-      const unwrapped = (parsed && typeof parsed === "object" && "raw_content" in (parsed as Record<string, unknown>))
-        ? (parsed as Record<string, unknown>).raw_content
-        : parsed;
-      const plainText = extractEventText(unwrapped, body.source!);
-      return {
-        source_id: row.source_id,
-        received_at: row.received_at,
-        decrypt_ok: true,
-        extracted_text_preview: plainText.slice(0, 200),
-        would_be_skipped: !plainText || plainText === "(no readable message content captured)",
-      };
-    } catch (err) {
-      return { source_id: row.source_id, received_at: row.received_at, decrypt_ok: false, error: err instanceof Error ? err.message : String(err) };
-    }
-  }));
-
-  return json({ tenant_id: body.tenant_id, source: body.source, sampled: inspected.length, results: inspected });
-}
-
-// Small debug helper - which tenants actually have raw_events to replay,
-// so Checkpoint A verification can pick a real one without needing raw SQL
-// access. Read-only, admin pool, no mutation.
 async function handleDebugTenants(): Promise<Response> {
   const rows = await withAdmin(async (sql) => {
     return await sql`
@@ -1256,9 +1005,7 @@ Deno.serve(async (req) => {
     const authError = requireServiceRole(req);
     if (authError) return authError;
 
-    if (path.endsWith("/fixtures/load") && req.method === "POST") return await handleFixturesLoad(req);
     if (path.endsWith("/debug/tenants") && req.method === "GET") return await handleDebugTenants();
-    if (path.endsWith("/debug/inspect-replay-source") && req.method === "POST") return await handleDebugInspectReplaySource(req);
     if (path.endsWith("/debug/memories") && req.method === "GET") {
       const tenantId = url.searchParams.get("tenant_id");
       if (!tenantId) return json({ detail: "tenant_id query param required" }, 400);

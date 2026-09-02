@@ -273,6 +273,9 @@ Hard disambiguation:
   - alternatives_considered: options explicitly considered/rejected; empty if none.
   - actors: people explicitly named. "decided_by" (at most one) only if the event states they decided/own/resolve the blocker; else "mentioned". Empty if none named. Never invent an owner or guess from the envelope unless that person is named as owner in the event text. If only a display name appears with no provider id, actors=[].
   - confidence: 0-1 from how explicit the text is. Vague replies needing unseen context ≤ 0.5.
+  - attribute_key: lower_snake_case slug for WHICH fact this is (e.g. "launch_date", "backend_framework") - same question gets the same key across different events so reconciliation can find it. Null on DISCARD.
+  - due_date: ISO date only for action_item with a stated deadline; else null.
+  - tags: system/topic/product names mentioned (e.g. "kubernetes", "stripe") - never a person, team, or project.
 
 Call record_triage_and_extraction exactly once with classification, confidence, reason_code, and — when not DISCARD — the extracted record.
 
@@ -469,6 +472,20 @@ const TRIAGE_EXTRACTION_TOOL = {
         items: { type: "string" },
         description: "Explicitly named options considered/rejected; else empty.",
       },
+      attribute_key: {
+        type: ["string", "null"],
+        description:
+          "Stable lower_snake_case slug identifying WHICH fact this is about (e.g. 'launch_date', 'backend_framework', 'q3_budget') - used to find prior memories that might be the same fact under bounded reconciliation. Same real-world question -> same key, even if the wording differs. Null on DISCARD.",
+      },
+      due_date: {
+        type: ["string", "null"],
+        description: "ISO 8601 date (YYYY-MM-DD) only when record_type=action_item and a concrete deadline is stated; else null.",
+      },
+      tags: {
+        type: "array",
+        items: { type: "string" },
+        description: "Content concepts referenced (systems, topics, products - e.g. 'kubernetes', 'billing', 'auth0'). These are searchable metadata, not entities - never a person, team, or project name.",
+      },
       actors: {
         type: "array",
         items: {
@@ -494,6 +511,7 @@ const TRIAGE_EXTRACTION_TOOL = {
     required: [
       "decision", "confidence", "reason_code", "record_type", "status",
       "decision_statement", "rationale", "alternatives_considered", "actors",
+      "attribute_key", "due_date", "tags",
     ],
     additionalProperties: false,
   },
@@ -575,6 +593,117 @@ async function resolveActorId(
     ? await sql`INSERT INTO actors (tenant_id, slack_user_id, kind) VALUES (${tenantId}, ${sourceActorId}, 'internal') RETURNING id`
     : await sql`INSERT INTO actors (tenant_id, notion_user_id, kind) VALUES (${tenantId}, ${sourceActorId}, 'internal') RETURNING id`;
   return created[0].id;
+}
+
+// ── Deterministic entity resolution (memory-explorer-upgrade Section 3) ──
+// Zero LLM calls, zero vector search: an entity is upserted by a stable
+// connector-native anchor (an actor's resolved identity, or a Slack
+// channel / Notion page id), keyed by the partial unique index on
+// (tenant_id, entity_type, source_anchor). Re-encountering the same anchor
+// always resolves to the same entity row - no embedding similarity band,
+// no judgeEntityMatch call, no review-queue path. This deliberately can
+// only create Person/Team/Project entities (the 3 types with a real
+// connector-native identifier) - System/Topic/Product concepts are never
+// entities under this model, see the `tags` column instead.
+// deno-lint-ignore no-explicit-any
+async function resolveDeterministicEntity(
+  sql: any, tenantId: string, entityType: "Person" | "Team" | "Project",
+  sourceAnchor: string, canonicalName: string,
+): Promise<string> {
+  // 'current' is the real status value entities.status accepts (check
+  // (status in ('current', 'superseded')), added by
+  // 20260822050000_entity_supersession_and_merge_review.sql) - 'active' was
+  // a mistaken carry-over from source_connections.status, a different
+  // column on a different table, and would have failed every single insert
+  // with a check-constraint violation. Caught in review before merge.
+  const existing = await sql`
+    SELECT entity_id FROM public.entities
+    WHERE tenant_id = ${tenantId} AND entity_type = ${entityType} AND source_anchor = ${sourceAnchor} AND status = 'current'
+  `;
+  if (existing.length > 0) return existing[0].entity_id as string;
+
+  const created = await sql`
+    INSERT INTO public.entities (tenant_id, entity_type, canonical_name, source_anchor, status)
+    VALUES (${tenantId}, ${entityType}, ${canonicalName}, ${sourceAnchor}, 'current')
+    ON CONFLICT (tenant_id, entity_type, source_anchor) WHERE source_anchor IS NOT NULL AND status = 'current'
+    DO UPDATE SET canonical_name = EXCLUDED.canonical_name
+    RETURNING entity_id
+  `;
+  return created[0].entity_id as string;
+}
+
+// ── Bounded 3-way reconciliation (memory-explorer-upgrade Section 4) ────
+// Zero-cost fast path: if the deterministic pre-filter (same tenant/type/
+// attribute_key, status='current', not yet superseded, newest 3) finds no
+// candidate, this returns immediately without spending a single Claude
+// token - the majority case, since most new memories are about a fact
+// nothing existing recorded yet. Only when real candidates exist does this
+// spend one Haiku call, classifying into exactly 3 outcomes (no
+// different_concept - candidates are already pre-filtered to the same
+// attribute_key, so "different fact" can't reach this call at all).
+const RECONCILE_TOOL = {
+  name: "record_reconciliation",
+  description: "Classify how a new memory relates to up to 3 prior candidates about the same attribute_key.",
+  input_schema: {
+    type: "object",
+    properties: {
+      classifications: {
+        type: "array",
+        items: {
+          type: "object",
+          properties: {
+            candidate_number: { type: "integer" },
+            relation: { type: "string", enum: ["same_fact", "update", "conflict"] },
+            reason: { type: "string" },
+          },
+          required: ["candidate_number", "relation", "reason"],
+          additionalProperties: false,
+        },
+      },
+    },
+    required: ["classifications"],
+    additionalProperties: false,
+  },
+};
+const RECONCILE_SYSTEM_PROMPT = `You compare a new memory against up to 3 prior candidates that already share its exact attribute_key (the same underlying question - candidates were pre-filtered on that, so never classify "different fact", only pick among these 3:
+
+- same_fact: the new memory restates the existing one without a real change.
+- update: a natural evolution of the same fact (e.g. a date moved, a decision revised) - the new one should replace the old one going forward.
+- conflict: genuinely incompatible claims about the same fact with no clear supersession (e.g. two different people asserting different values with equal confidence, neither explicitly correcting the other).
+
+Call record_reconciliation exactly once with one classification per candidate, in the order given.`;
+
+// deno-lint-ignore no-explicit-any
+async function boundedReconcile(
+  sql: any, tenantId: string, memoryType: string, attributeKey: string | null, newMemoryId: string,
+): Promise<{ relation: string; candidateMemoryId: string }[]> {
+  if (!attributeKey) return [];
+
+  const candidates = await sql`
+    SELECT memory_id, title, summary, valid_from
+    FROM public.memories
+    WHERE tenant_id = ${tenantId} AND type = ${memoryType} AND attribute_key = ${attributeKey}
+      AND status = 'current' AND valid_until IS NULL AND memory_id != ${newMemoryId}
+    ORDER BY valid_from DESC
+    LIMIT 3
+  `;
+  if (candidates.length === 0) return []; // zero-cost fast path - no Claude call
+
+  const newMemory = await sql`SELECT title, summary FROM public.memories WHERE memory_id = ${newMemoryId}`;
+  const userMessage = [
+    `New memory: ${newMemory[0].title}. ${newMemory[0].summary}`,
+    "Candidates:",
+    ...candidates.map((c: { title: string; summary: string }, i: number) => `${i + 1}. ${c.title}. ${c.summary}`),
+  ].join("\n");
+
+  const result = await callClaude(
+    RECONCILE_SYSTEM_PROMPT, userMessage, RECONCILE_TOOL, "record_reconciliation", 512, EXTRACT_MODEL, 20_000, true,
+  ) as { classifications: { candidate_number: number; relation: string; reason: string }[] };
+
+  return (result.classifications ?? []).map((c) => ({
+    relation: c.relation,
+    candidateMemoryId: candidates[c.candidate_number - 1]?.memory_id as string,
+  })).filter((c) => c.candidateMemoryId);
 }
 
 // slack-webhook only had enough data to build a slack:// deep link (opens
@@ -797,6 +926,7 @@ async function handleIngestionMessageInner(msg: PgmqMsg): Promise<string> {
     record_type: string | null; status: string | null; decision_statement: string | null;
     rationale: string | null; alternatives_considered: string[];
     actors: { source_actor_id: string; role: string }[];
+    attribute_key: string | null; due_date: string | null; tags: string[];
   };
 
   if (result.decision === "DISCARD") {
@@ -831,6 +961,7 @@ async function handleIngestionMessageInner(msg: PgmqMsg): Promise<string> {
   const extraction = result as {
     record_type: string; status: string; decision_statement: string; rationale: string | null;
     alternatives_considered: string[]; actors: { source_actor_id: string; role: string }[]; confidence: number;
+    attribute_key: string | null; due_date: string | null; tags: string[];
   };
   extraction.confidence = result.confidence;
 
@@ -843,56 +974,139 @@ async function handleIngestionMessageInner(msg: PgmqMsg): Promise<string> {
   extraction.rationale = extraction.rationale ? redactFinancialInfo(extraction.rationale) : extraction.rationale;
   extraction.alternatives_considered = (extraction.alternatives_considered ?? []).map(redactFinancialInfo);
 
-  // Persist (decision + source + actors), mark done, enqueue embedding
-  const decisionId = await withTenant(tenantId, async (sql) => {
-    const existingDecision = await sql`
-      SELECT id FROM public.decisions WHERE tenant_id = ${tenantId} AND origin_raw_event_id = ${rawEventId}
-    `;
-    if (existingDecision.length > 0) return existingDecision[0].id as string;
+  // record_type (decision | action_item | blocker) maps directly onto the
+  // 3-core-type taxonomy (memory-explorer-upgrade Section 2) - action_item
+  // becomes Commitment, everything else keeps its name.
+  const MEMORY_TYPE: Record<string, string> = { decision: "Decision", action_item: "Commitment", blocker: "Blocker" };
+  const memoryType = MEMORY_TYPE[extraction.record_type] ?? "Decision";
 
-    const decisionRows = await sql`
-      INSERT INTO public.decisions (
-        tenant_id, record_type, decision_statement, rationale, alternatives_considered,
-        status, scope, confidence, permission_scope, origin_raw_event_id
-      ) VALUES (
-        ${tenantId}, ${extraction.record_type}, ${extraction.decision_statement}, ${extraction.rationale},
-        ${extraction.alternatives_considered ?? []}, ${extraction.status}, 'team',
-        ${extraction.confidence}, ${payload.permission_scope ?? []}, ${rawEventId}
-      ) RETURNING id
+  // Persist (memory + entities + provenance), reconcile, mark done, enqueue embedding.
+  const { memoryId, skipEmbedding } = await withTenant(tenantId, async (sql): Promise<{ memoryId: string; skipEmbedding: boolean }> => {
+    const existingMemory = await sql`
+      SELECT memory_id FROM public.memory_source_events WHERE tenant_id = ${tenantId} AND raw_event_id = ${rawEventId}
     `;
-    const newDecisionId = decisionRows[0].id as string;
+    if (existingMemory.length > 0) return { memoryId: existingMemory[0].memory_id as string, skipEmbedding: true };
+
+    const payloadJson = JSON.stringify({
+      attribute_key: extraction.attribute_key,
+      rationale: extraction.rationale,
+      alternatives_considered: extraction.alternatives_considered ?? [],
+      due_date: extraction.due_date,
+      decision_status: extraction.status,
+    });
+
+    const memoryRows = await sql`
+      INSERT INTO public.memories (
+        tenant_id, type, title, summary, payload, tags,
+        occurred_at, valid_from, observed_at, confidence, status, searchable_text
+      ) VALUES (
+        ${tenantId}, ${memoryType}, ${extraction.decision_statement}, ${extraction.decision_statement},
+        ${payloadJson}::jsonb, ${extraction.tags ?? []},
+        ${payload.received_at}, ${payload.received_at}, now(), ${extraction.confidence}, 'current',
+        ${buildSearchableText(extraction.decision_statement, extraction.rationale, extraction.alternatives_considered)}
+      ) RETURNING memory_id
+    `;
+    const newMemoryId = memoryRows[0].memory_id as string;
 
     const permalink = payload.source === "slack" && payload.permission_scope?.[0]
       ? await resolveSlackPermalink(sql, tenantId, payload.permission_scope[0], payload.source_id, payload.source_permalink)
       : payload.source_permalink;
 
-    if (permalink) {
-      await sql`
-        INSERT INTO public.decision_sources (tenant_id, decision_id, raw_event_id, permalink)
-        VALUES (${tenantId}, ${newDecisionId}, ${rawEventId}, ${permalink})
-        ON CONFLICT (decision_id, permalink) DO NOTHING
-      `;
-    }
+    await sql`
+      INSERT INTO public.memory_source_events (tenant_id, memory_id, raw_event_id)
+      VALUES (${tenantId}, ${newMemoryId}, ${rawEventId})
+      ON CONFLICT DO NOTHING
+    `;
+    await sql`
+      INSERT INTO public.memory_citations (tenant_id, memory_id, raw_event_id, excerpt_ref)
+      VALUES (${tenantId}, ${newMemoryId}, ${rawEventId}, ${permalink ?? "full-content"})
+    `;
 
+    // Deterministic entity linking - zero LLM/vector calls. Person per
+    // named actor (same connector-native id resolveActorId already uses);
+    // Project from the event's own permission scope (the Slack channel /
+    // Notion page this came from) when one exists. Canonical name for
+    // Project falls back to the raw scope id since a friendly name isn't
+    // available in this payload - a real follow-up (same shape as
+    // resolveSlackPermalink) could resolve it via the connector API.
     for (const actorRef of extraction.actors ?? []) {
       try {
-        const actorId = await resolveActorId(sql, tenantId, payload.source, actorRef.source_actor_id);
+        const anchor = `${payload.source}:${actorRef.source_actor_id}`;
+        const entityId = await resolveDeterministicEntity(sql, tenantId, "Person", anchor, actorRef.source_actor_id);
         await sql`
-          INSERT INTO public.decision_actors (tenant_id, decision_id, actor_id, role)
-          VALUES (${tenantId}, ${newDecisionId}, ${actorId}, ${actorRef.role})
-          ON CONFLICT (decision_id, actor_id, role) DO NOTHING
+          INSERT INTO public.memory_entities (memory_id, entity_id, tenant_id)
+          VALUES (${newMemoryId}, ${entityId}, ${tenantId})
+          ON CONFLICT DO NOTHING
         `;
-      } catch {
-        // Unsupported actor source or resolution failure - skip this actor,
-        // never fail the whole decision over one bad reference.
+      } catch (err) {
+        console.error(`Failed to resolve Person entity for actor ${actorRef.source_actor_id}:`, err);
+      }
+    }
+    const projectScope = payload.permission_scope?.[0];
+    if (projectScope) {
+      try {
+        const anchor = `${payload.source}:${projectScope}`;
+        const entityId = await resolveDeterministicEntity(sql, tenantId, "Project", anchor, projectScope);
+        await sql`
+          INSERT INTO public.memory_entities (memory_id, entity_id, tenant_id)
+          VALUES (${newMemoryId}, ${entityId}, ${tenantId})
+          ON CONFLICT DO NOTHING
+        `;
+      } catch (err) {
+        console.error(`Failed to resolve Project entity for scope ${projectScope}:`, err);
+      }
+    }
+
+    // Bounded 3-way reconciliation (memory-explorer-upgrade Section 4).
+    const reconciliation = await boundedReconcile(sql, tenantId, memoryType, extraction.attribute_key, newMemoryId);
+    let finalMemoryId = newMemoryId;
+    let skipEmbedding = false;
+    for (const r of reconciliation) {
+      if (r.relation === "update") {
+        await sql`UPDATE public.memories SET status = 'superseded', valid_until = now() WHERE memory_id = ${r.candidateMemoryId}`;
+        await sql`UPDATE public.memories SET supersedes = ${r.candidateMemoryId} WHERE memory_id = ${newMemoryId}`;
+      } else if (r.relation === "conflict") {
+        await sql`UPDATE public.memories SET status = 'unresolved' WHERE memory_id = ${newMemoryId}`;
+        await sql`
+          INSERT INTO public.memory_conflicts (tenant_id, memory_id, related_memory_id, relationship)
+          VALUES (${tenantId}, ${newMemoryId}, ${r.candidateMemoryId}, 'conflict')
+          ON CONFLICT (memory_id, related_memory_id) DO NOTHING
+        `;
+      } else if (r.relation === "same_fact") {
+        // The new memory restates an already-current one - not an update,
+        // not a conflict. Per review feedback: marking the new row
+        // 'superseded' made a freshly-reconfirmed fact display a
+        // "Superseded" badge, which reads backwards (nothing was
+        // replaced). Instead, attach this event's real provenance to the
+        // EXISTING memory as additional evidence and drop the redundant
+        // new row outright - the existing memory's content didn't change,
+        // so it doesn't need a new embedding either.
+        await sql`
+          INSERT INTO public.memory_source_events (tenant_id, memory_id, raw_event_id)
+          VALUES (${tenantId}, ${r.candidateMemoryId}, ${rawEventId})
+          ON CONFLICT DO NOTHING
+        `;
+        await sql`
+          INSERT INTO public.memory_citations (tenant_id, memory_id, raw_event_id, excerpt_ref)
+          VALUES (${tenantId}, ${r.candidateMemoryId}, ${rawEventId}, ${permalink ?? "full-content"})
+        `;
+        await sql`DELETE FROM public.memories WHERE memory_id = ${newMemoryId}`;
+        finalMemoryId = r.candidateMemoryId;
+        skipEmbedding = true;
+        break; // newMemoryId no longer exists - nothing left in `reconciliation` can apply to it
       }
     }
 
     await sql`UPDATE public.raw_events SET pipeline_status = 'done' WHERE id = ${rawEventId}`;
-    return newDecisionId;
+    return { memoryId: finalMemoryId, skipEmbedding };
   });
 
-  await pgmqSend("embedding_queue", { tenant_id: tenantId, decision_id: decisionId });
+  // skipEmbedding covers two cases: a retried duplicate (memory already has
+  // its embedding from the first pass) and same_fact reconciliation (the
+  // surviving memory's content is unchanged - only its provenance grew).
+  if (!skipEmbedding) {
+    await pgmqSend("embedding_queue", { tenant_id: tenantId, memory_id: memoryId });
+  }
   await pgmqDelete("ingestion", msg.msg_id);
   return "persisted";
 }
@@ -1102,14 +1316,53 @@ async function detectConflicts(
   }
 }
 
+// New path for the unified memories pipeline: reconciliation already ran
+// synchronously during ingestion (boundedReconcile), so this only ever
+// embeds - no detectConflicts call, that's dead code for memory_id jobs by
+// design, not an oversight.
+async function handleMemoryEmbeddingMessage(tenantId: string, memoryId: string, msgId: number): Promise<string> {
+  const row = await withTenant(tenantId, async (sql) => {
+    const rows = await sql`SELECT searchable_text FROM public.memories WHERE memory_id = ${memoryId} AND tenant_id = ${tenantId}`;
+    return rows[0] ?? null;
+  });
+
+  if (row === null) {
+    await pgmqDelete("embedding_queue", msgId);
+    return "memory_not_found";
+  }
+
+  const embedding = await embedDocument(row.searchable_text);
+  const vectorLiteral = "[" + embedding.join(",") + "]";
+
+  await withTenant(tenantId, async (sql) => {
+    await sql`
+      INSERT INTO public.memory_embeddings (memory_id, tenant_id, embedding, embedding_model, embedded_at)
+      VALUES (${memoryId}, ${tenantId}, ${vectorLiteral}::vector, ${VOYAGE_MODEL}, now())
+      ON CONFLICT (memory_id) DO UPDATE SET
+        embedding = EXCLUDED.embedding, embedding_model = EXCLUDED.embedding_model, embedded_at = EXCLUDED.embedded_at
+    `;
+  });
+
+  await pgmqDelete("embedding_queue", msgId);
+  return "embedded";
+}
+
 async function handleEmbeddingMessage(msg: PgmqMsg): Promise<string> {
   try {
-    const job = msg.message as { tenant_id: string; decision_id: string };
+    const job = msg.message as { tenant_id: string; decision_id?: string; memory_id?: string };
+    if (job.memory_id) {
+      return await handleMemoryEmbeddingMessage(job.tenant_id, job.memory_id, msg.msg_id);
+    }
+    const decisionId = job.decision_id;
+    if (!decisionId) {
+      await pgmqDelete("embedding_queue", msg.msg_id);
+      return "malformed_embedding_job";
+    }
 
     const row = await withTenant(job.tenant_id, async (sql) => {
       const rows = await sql`
         SELECT decision_statement, rationale, alternatives_considered
-        FROM public.decisions WHERE id = ${job.decision_id} AND tenant_id = ${job.tenant_id}
+        FROM public.decisions WHERE id = ${decisionId} AND tenant_id = ${job.tenant_id}
       `;
       return rows[0] ?? null;
     });
@@ -1129,13 +1382,13 @@ async function handleEmbeddingMessage(msg: PgmqMsg): Promise<string> {
     await withTenant(job.tenant_id, async (sql) => {
       await sql`
         INSERT INTO public.decision_embeddings (decision_id, tenant_id, embedding, embedding_model, embedded_at)
-        VALUES (${job.decision_id}, ${job.tenant_id}, ${vectorLiteral}::vector, ${VOYAGE_MODEL}, now())
+        VALUES (${decisionId}, ${job.tenant_id}, ${vectorLiteral}::vector, ${VOYAGE_MODEL}, now())
         ON CONFLICT (decision_id) DO UPDATE SET
           embedding = EXCLUDED.embedding, embedding_model = EXCLUDED.embedding_model, embedded_at = EXCLUDED.embedded_at
       `;
     });
 
-    await detectConflicts(job.tenant_id, job.decision_id, row.decision_statement, row.rationale, embedding);
+    await detectConflicts(job.tenant_id, decisionId, row.decision_statement, row.rationale, embedding);
 
     await pgmqDelete("embedding_queue", msg.msg_id);
     return "embedded";

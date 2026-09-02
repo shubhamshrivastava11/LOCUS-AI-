@@ -419,16 +419,19 @@ export async function listAllDecisions(hardCap = 2000): Promise<DecisionOut[]> {
 // exactly - this is the JSON shape loadMemoriesForTenant() assembles and
 // GET /memories / GET /memories/:id/evidence return as-is, no reshaping.
 
-export type MemoryType =
-  | 'Context' | 'Change' | 'Commitment' | 'Decision'
-  | 'Rationale' | 'Blocker' | 'Outcome' | 'Requirement' | 'CustomerSignal'
+// 3-core-type taxonomy (memory-explorer upgrade). Rationale/Outcome/
+// Requirement/Change/CustomerSignal collapsed into Decision's payload -
+// see the migration's comment for the full mapping.
+export type MemoryType = 'Decision' | 'Commitment' | 'Blocker'
 
 export type MemoryStatus =
   | 'proposed' | 'current' | 'stale' | 'superseded' | 'contradicted' | 'unresolved'
 
 export type FreshnessState = 'fresh' | 'aging' | 'stale'
 
-export type EntityType = 'Person' | 'Team' | 'Project' | 'Customer' | 'Product' | 'Topic' | 'System'
+// Customer/Product/Topic/System demoted to memory.tags (searchable
+// metadata) rather than relational entities - see the migration's comment.
+export type EntityType = 'Person' | 'Team' | 'Project'
 
 export interface MemoryEntityRef {
   entity_id: string

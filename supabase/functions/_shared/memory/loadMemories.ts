@@ -36,16 +36,36 @@ export async function loadMemoriesForTenant(sql: any, tenantId: string, entityId
       join public.entities e on e.entity_id = me.entity_id
       where me.memory_id = any(${memoryIds})
     `,
+    // LEFT JOIN to both possible provenance sources, not just
+    // memory_fixture_events: ai-worker (memory-explorer upgrade) writes
+    // raw_event_id and leaves fixture_event_id null on every new row, while
+    // rows from the earlier fixture/replay pipeline still carry only
+    // fixture_event_id. The migration's own check constraint guarantees
+    // exactly one of the two is ever set, so COALESCE always picks the real
+    // one - an inner join on fixture_event_id alone (the pre-review-fix
+    // version of this query) silently returned zero source_events/citations
+    // for every memory ai-worker writes now, which emptied the evidence
+    // drawer for all new captures. Caught in review before merge.
     sql`
-      select mse.memory_id, mfe.id as event_id, mfe.source, mfe.source_id, mfe.permission_scope
+      select mse.memory_id,
+             coalesce(mfe.id, re.id) as event_id,
+             coalesce(mfe.source, re.source) as source,
+             coalesce(mfe.source_id, re.source_id) as source_id,
+             coalesce(mfe.permission_scope, re.permission_scope) as permission_scope
       from public.memory_source_events mse
-      join public.memory_fixture_events mfe on mfe.id = mse.fixture_event_id
+      left join public.memory_fixture_events mfe on mfe.id = mse.fixture_event_id
+      left join public.raw_events re on re.id = mse.raw_event_id
       where mse.memory_id = any(${memoryIds})
     `,
     sql`
-      select mc.memory_id, mfe.id as event_id, mfe.source, mfe.source_id, mc.excerpt_ref
+      select mc.memory_id,
+             coalesce(mfe.id, re.id) as event_id,
+             coalesce(mfe.source, re.source) as source,
+             coalesce(mfe.source_id, re.source_id) as source_id,
+             mc.excerpt_ref
       from public.memory_citations mc
-      join public.memory_fixture_events mfe on mfe.id = mc.fixture_event_id
+      left join public.memory_fixture_events mfe on mfe.id = mc.fixture_event_id
+      left join public.raw_events re on re.id = mc.raw_event_id
       where mc.memory_id = any(${memoryIds})
     `,
     // memory_conflicts only ever stores the 'conflict' relationship (see

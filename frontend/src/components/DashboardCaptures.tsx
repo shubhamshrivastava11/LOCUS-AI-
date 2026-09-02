@@ -1,19 +1,24 @@
 import { useEffect, useState } from 'react'
-import { ApiError, listDecisions, type DecisionOut } from '../lib/api'
-import { decisionToMemoryRecord } from '../lib/memoryRecord'
+import { ApiError, listMemories, type CanonicalMemory } from '../lib/api'
+import { memoryToMemoryRecord } from '../lib/memoryRecord'
 import { MemoryRecordDetail, TYPE_STYLES } from './MemoryRecordDetail'
 
 export function DashboardCaptures() {
-  const [captures, setCaptures] = useState<DecisionOut[]>([])
+  const [captures, setCaptures] = useState<CanonicalMemory[]>([])
   const [isLoading, setIsLoading] = useState(true)
   const [error, setError] = useState('')
   const [expandedId, setExpandedId] = useState<string | null>(null)
 
   useEffect(() => {
     let active = true
-    listDecisions(5, 0)
+    // ai-worker (memory-explorer upgrade) writes straight to public.memories
+    // now, not public.decisions - this used to be listDecisions(5, 0), which
+    // would show nothing at all for any capture made after that change
+    // shipped. Most-recent-first, sliced to 5 to match the old page size
+    // since /memories doesn't take a limit/offset itself.
+    listMemories()
       .then((response) => {
-        if (active) setCaptures(response.items)
+        if (active) setCaptures(response.memories.slice(0, 5))
       })
       .catch((err: unknown) => {
         if (active) setError(err instanceof ApiError ? err.message : 'Unable to load recent captures.')
@@ -41,11 +46,11 @@ export function DashboardCaptures() {
         ) : (
           <ul>
             {captures.map((capture, i) => {
-              const record = decisionToMemoryRecord(capture)
-              const isExpanded = expandedId === capture.id
+              const record = memoryToMemoryRecord(capture)
+              const isExpanded = expandedId === capture.memory_id
               return (
                 <li
-                  key={capture.id}
+                  key={capture.memory_id}
                   className={i < captures.length - 1 ? 'border-b border-[#F0F0F4]' : ''}
                 >
                   {isExpanded ? (
@@ -55,7 +60,7 @@ export function DashboardCaptures() {
                   ) : (
                     <button
                       type="button"
-                      onClick={() => setExpandedId(capture.id)}
+                      onClick={() => setExpandedId(capture.memory_id)}
                       className="grid w-full grid-cols-[92px_minmax(0,1fr)_auto] items-center gap-3 px-4 py-3.5 text-left transition-colors hover:bg-[#FAFAFB]"
                       aria-expanded={false}
                     >
