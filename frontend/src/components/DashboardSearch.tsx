@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react'
 import { getSupabaseClient } from '../lib/supabase'
-import { ApiError, getDecision, listDecisions, searchDecisions, type SearchResponse } from '../lib/api'
+import { ApiError, getDecision, listDecisions, searchDecisionsStreaming, type SearchResponse } from '../lib/api'
 import { DEMO_EMAIL_KEY } from '../lib/sessionKeys'
 import { decisionToMemoryRecord } from '../lib/memoryRecord'
 import { MemoryRecordDetail, type MemoryRecord } from './MemoryRecordDetail'
@@ -107,6 +107,9 @@ export function DashboardSearch() {
   const [question, setQuestion] = useState('')
   const [isSearching, setIsSearching] = useState(false)
   const [result, setResult] = useState<SearchResponse | null>(null)
+  // Answer text as it arrives, before the final structured payload (with
+  // citations) lands. Cleared once `result` takes over the rendering.
+  const [streamingAnswer, setStreamingAnswer] = useState('')
   const [error, setError] = useState('')
   const [recentSearches, setRecentSearches] = useState<RecentSearch[]>([])
   const [suggestions, setSuggestions] = useState<string[]>([])
@@ -150,10 +153,14 @@ export function DashboardSearch() {
     setIsSearching(true)
     setError('')
     setResult(null)
+    setStreamingAnswer('')
 
     try {
-      const response = await searchDecisions(trimmed)
+      const response = await searchDecisionsStreaming(trimmed, (chunk) => {
+        setStreamingAnswer((current) => current + chunk)
+      })
       setResult(response)
+      setStreamingAnswer('')
       setRecentSearches((current) => [{ query: trimmed, at: Date.now() }, ...current].slice(0, 5))
       recordSearchHistory(trimmed, response.citations.length)
     } catch (err) {
@@ -236,6 +243,15 @@ export function DashboardSearch() {
       {error ? (
         <div className="mb-6 rounded-xl border border-[#F3D6D6] bg-[#FFF7F7] px-4 py-3 text-[14px] text-[#B4232C]">
           {error}
+        </div>
+      ) : null}
+
+      {!result && streamingAnswer ? (
+        <div className="mb-7 rounded-xl border border-[#E8E8ED] bg-white p-5 shadow-[0_1px_2px_rgba(16,24,40,0.04)]">
+          <p className="text-[15px] leading-6 whitespace-pre-wrap text-[#111827]">
+            {streamingAnswer}
+            <span className="ml-0.5 inline-block h-[1.05em] w-[2px] translate-y-[0.15em] animate-pulse bg-[#5A45FF] align-middle" />
+          </p>
         </div>
       ) : null}
 

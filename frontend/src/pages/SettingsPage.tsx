@@ -15,6 +15,7 @@ import {
 
 type SettingsSection =
   | 'Account'
+  | 'Team'
   | 'Connected Sources'
   | 'Build Memory'
   | 'Privacy'
@@ -22,8 +23,8 @@ type SettingsSection =
   | 'Notifications'
 
 type CaptureMode = 'decisions-actions' | 'decisions-only'
-type SourceFilter = 'All' | 'Gmail' | 'Notion' | 'Slack' | 'Jira' | 'Confluence' | 'Discord' | 'GitHub' | 'Monday' | 'ClickUp' | 'Outlook'
-type CaptureSource = 'slack' | 'notion' | 'gmail' | 'jira' | 'confluence' | 'discord' | 'github' | 'monday' | 'clickup' | 'outlook_calendar'
+type SourceFilter = 'All' | 'Gmail' | 'Notion' | 'Slack' | 'Jira' | 'Confluence' | 'Discord' | 'GitHub' | 'Monday' | 'ClickUp' | 'Teams'
+type CaptureSource = 'slack' | 'notion' | 'gmail' | 'jira' | 'confluence' | 'discord' | 'github' | 'monday' | 'clickup' | 'teams'
 
 type ChannelRow = {
   id: string
@@ -44,7 +45,7 @@ const SOURCE_APP_LABELS: Record<CaptureSource, Exclude<SourceFilter, 'All'>> = {
   github: 'GitHub',
   monday: 'Monday',
   clickup: 'ClickUp',
-  outlook_calendar: 'Outlook',
+  teams: 'Teams',
 }
 
 type SearchHistoryItem = {
@@ -56,6 +57,7 @@ type SearchHistoryItem = {
 
 const SIDEBAR_ITEMS: { id: SettingsSection; label: string }[] = [
   { id: 'Account', label: 'Account' },
+  { id: 'Team', label: 'Team' },
   { id: 'Connected Sources', label: 'Connected Sources' },
   { id: 'Build Memory', label: 'Build Memory' },
   { id: 'Privacy', label: 'Privacy' },
@@ -63,7 +65,7 @@ const SIDEBAR_ITEMS: { id: SettingsSection; label: string }[] = [
   { id: 'Notifications', label: 'Notifications' },
 ]
 
-const SOURCE_FILTERS: SourceFilter[] = ['All', 'Gmail', 'Notion', 'Slack', 'Jira', 'Confluence', 'Discord', 'GitHub', 'Monday', 'ClickUp', 'Outlook']
+const SOURCE_FILTERS: SourceFilter[] = ['All', 'Gmail', 'Notion', 'Slack', 'Jira', 'Confluence', 'Discord', 'GitHub', 'Monday', 'ClickUp']
 
 function AccountIcon() {
   return (
@@ -88,6 +90,16 @@ function LightningIcon() {
         strokeWidth="1.8"
         strokeLinejoin="round"
       />
+    </svg>
+  )
+}
+
+function PeopleIcon() {
+  return (
+    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+      <circle cx="9" cy="8" r="3" stroke="currentColor" strokeWidth="1.8" />
+      <path d="M3.5 20c0-3.3 2.5-6 5.5-6s5.5 2.7 5.5 6" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" />
+      <path d="M16 8.2a2.8 2.8 0 010 5.5M18.5 20c0-2.9-1.9-5.3-4.4-5.9" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" />
     </svg>
   )
 }
@@ -209,6 +221,7 @@ function Toggle({
 
 const SIDEBAR_ICONS: Record<SettingsSection, ReactNode> = {
   Account: <AccountIcon />,
+  Team: <PeopleIcon />,
   'Connected Sources': <LightningIcon />,
   'Build Memory': <HashIcon />,
   Privacy: <ShieldIcon />,
@@ -493,9 +506,9 @@ const CONNECTED_SOURCE_META: { id: SourceId; name: SourceName; description: stri
     description: 'Capture decisions from tasks and comments.',
   },
   {
-    id: 'outlook_calendar',
-    name: 'Outlook',
-    description: 'Capture decisions from meeting descriptions.',
+    id: 'teams',
+    name: 'Teams',
+    description: 'Capture decisions from channel conversations. A Microsoft 365 admin must approve this once for your organisation.',
   },
 ]
 
@@ -520,6 +533,572 @@ function connectionLabel(row: SourceConnectionRow): string | null {
   return row.display_name ?? row.external_workspace_id ?? null
 }
 
+type TeamMember = {
+  membership_id: string
+  user_id: string
+  email: string | null
+  display_name: string | null
+  role: string
+  joined_at: string
+  is_self: boolean
+}
+type PendingInvite = { id: string; email: string; role: string; created_at: string }
+
+async function invokeTeamInvites<T = Record<string, unknown>>(body: Record<string, unknown>): Promise<{ data?: T; error?: string }> {
+  const { data, error } = await getSupabaseClient().functions.invoke('team-invites', { body })
+  if (error) return { error: error.message }
+  if (data?.error) return { error: String(data.error) }
+  return { data }
+}
+
+/**
+ * Settings > Team - lets a workspace owner/admin invite a teammate into
+ * this SAME tenant (not a new solo one - see supabase/functions/
+ * team-invites/index.ts's own header for why every signup used to get its
+ * own tenant with no way to join an existing one). Structure mirrors
+ * ConnectedSourcesSettings just below: rounded-2xl card, per-row
+ * border-b, icon/name left + status/action right, same dialog shape for
+ * the invite modal.
+ */
+function TeamSettings() {
+  const navigate = useNavigate()
+  const [members, setMembers] = useState<TeamMember[]>([])
+  const [invites, setInvites] = useState<PendingInvite[]>([])
+  const [isLoading, setIsLoading] = useState(true)
+  const [error, setError] = useState('')
+
+  const [isInviteOpen, setIsInviteOpen] = useState(false)
+  const [inviteEmail, setInviteEmail] = useState('')
+  const [inviteRole, setInviteRole] = useState<'member' | 'admin'>('member')
+  const [isInviting, setIsInviting] = useState(false)
+  const [inviteError, setInviteError] = useState('')
+  const [inviteResult, setInviteResult] = useState<{ url: string; emailSent: boolean } | null>(null)
+  const [copied, setCopied] = useState(false)
+
+  const [removeTarget, setRemoveTarget] = useState<TeamMember | null>(null)
+  const [isRemoving, setIsRemoving] = useState(false)
+  const [removeError, setRemoveError] = useState('')
+
+  const [isLeaveOpen, setIsLeaveOpen] = useState(false)
+  const [isLeaving, setIsLeaving] = useState(false)
+  const [leaveError, setLeaveError] = useState('')
+
+  // Real gap this closes: handle_new_user() names every new tenant after
+  // the founder's own personal name/email ("Abbas Rahman", not a company
+  // name) - fine for a solo signup, not once other people join it.
+  const [workspaceName, setWorkspaceName] = useState('')
+  const [isEditingName, setIsEditingName] = useState(false)
+  const [nameInput, setNameInput] = useState('')
+  const [isSavingName, setIsSavingName] = useState(false)
+  const [nameError, setNameError] = useState('')
+
+  // Real, server-enforced distinction (team-invites' create action rejects
+  // invites outright when this isn't 'team'), not just a UI nicety - an
+  // individual (self_serve) workspace genuinely can never invite anyone,
+  // chosen once on ChooseWorkspaceScreen and never upgraded afterward.
+  const [workspacePlan, setWorkspacePlan] = useState<string | null>(null)
+
+  const loadTeam = () =>
+    Promise.all([
+      invokeTeamInvites<{ members: TeamMember[]; workspace_name: string | null; workspace_plan: string | null }>({ action: 'members' }),
+      invokeTeamInvites<{ invites: PendingInvite[] }>({ action: 'list' }),
+    ]).then(([membersResult, invitesResult]) => {
+      if (membersResult.error) throw new Error(membersResult.error)
+      if (invitesResult.error) throw new Error(invitesResult.error)
+      setMembers(membersResult.data?.members ?? [])
+      setInvites(invitesResult.data?.invites ?? [])
+      setWorkspaceName(membersResult.data?.workspace_name ?? '')
+      setWorkspacePlan(membersResult.data?.workspace_plan ?? null)
+    })
+
+  useEffect(() => {
+    let active = true
+    loadTeam()
+      .catch((err) => {
+        if (active) setError(err instanceof Error ? err.message : 'Unable to load your team.')
+      })
+      .finally(() => {
+        if (active) setIsLoading(false)
+      })
+    return () => {
+      active = false
+    }
+  }, [])
+
+  const canManage = members.find((m) => m.is_self)?.role !== 'member'
+  const canInvite = canManage && workspacePlan === 'team'
+
+  const openEditName = () => {
+    setNameInput(workspaceName)
+    setNameError('')
+    setIsEditingName(true)
+  }
+
+  const handleSaveName = async () => {
+    const trimmed = nameInput.trim()
+    if (!trimmed) {
+      setNameError('Enter a workspace name.')
+      return
+    }
+    setIsSavingName(true)
+    setNameError('')
+
+    const result = await invokeTeamInvites<{ name: string }>({ action: 'rename_workspace', name: trimmed })
+    if (result.error || !result.data) {
+      setNameError(result.error ?? 'Unable to rename workspace.')
+      setIsSavingName(false)
+      return
+    }
+    setWorkspaceName(result.data.name)
+    setIsEditingName(false)
+    setIsSavingName(false)
+  }
+
+  const openInvite = () => {
+    setInviteEmail('')
+    setInviteRole('member')
+    setInviteError('')
+    setInviteResult(null)
+    setCopied(false)
+    setIsInviteOpen(true)
+  }
+
+  const handleInvite = async () => {
+    if (!inviteEmail.trim()) {
+      setInviteError('Enter an email address.')
+      return
+    }
+    setIsInviting(true)
+    setInviteError('')
+
+    const result = await invokeTeamInvites<{ invite_url: string; email_sent: boolean }>({
+      action: 'create', email: inviteEmail.trim(), role: inviteRole,
+    })
+    if (result.error || !result.data) {
+      setInviteError(result.error ?? 'Unable to send invite.')
+      setIsInviting(false)
+      return
+    }
+    setInviteResult({ url: result.data.invite_url, emailSent: result.data.email_sent })
+    await loadTeam().catch(() => {
+      // Invite still succeeded even if this refresh fails - not worth
+      // surfacing a second error on top of a successful action.
+    })
+    setIsInviting(false)
+  }
+
+  const handleRevoke = async (inviteId: string) => {
+    setInvites((current) => current.filter((i) => i.id !== inviteId))
+    const result = await invokeTeamInvites({ action: 'revoke', invite_id: inviteId })
+    if (result.error) {
+      setError(result.error)
+      await loadTeam().catch(() => undefined)
+    }
+  }
+
+  const handleRemoveMember = async () => {
+    if (!removeTarget) return
+    setIsRemoving(true)
+    setRemoveError('')
+
+    const result = await invokeTeamInvites({ action: 'remove_member', membership_id: removeTarget.membership_id })
+    if (result.error) {
+      setRemoveError(result.error)
+      setIsRemoving(false)
+      return
+    }
+    setMembers((current) => current.filter((m) => m.membership_id !== removeTarget.membership_id))
+    setRemoveTarget(null)
+    setIsRemoving(false)
+  }
+
+  const handleLeaveTeam = async () => {
+    setIsLeaving(true)
+    setLeaveError('')
+
+    const result = await invokeTeamInvites({ action: 'leave_team' })
+    if (result.error) {
+      setLeaveError(result.error)
+      setIsLeaving(false)
+      return
+    }
+    // Same signOut + redirect shape SettingsPage's own logout handler
+    // uses - simplest, already-proven way to land back on a clean
+    // sign-in state rather than lean on WaitlistScreen's "pending
+    // approval" wording, which doesn't really fit "you just left".
+    sessionStorage.removeItem(DEMO_EMAIL_KEY)
+    sessionStorage.removeItem(WORKSPACES_DONE_KEY)
+    sessionStorage.removeItem('locus:connected-tools')
+    await getSupabaseClient().auth.signOut()
+    navigate('/', { replace: true })
+  }
+
+  return (
+    <>
+      <div className="flex items-start justify-between gap-4">
+        <div className="min-w-0 flex-1">
+          <p className="text-[12px] font-semibold uppercase tracking-[0.06em] text-[#9CA3AF]">Team workspace</p>
+          {isEditingName ? (
+            <div className="mt-1">
+              <div className="flex items-center gap-2">
+                <input
+                  type="text"
+                  value={nameInput}
+                  onChange={(event) => setNameInput(event.target.value)}
+                  onKeyDown={(event) => {
+                    if (event.key === 'Enter') void handleSaveName()
+                    if (event.key === 'Escape') setIsEditingName(false)
+                  }}
+                  autoFocus
+                  maxLength={80}
+                  className="min-w-0 flex-1 rounded-lg border border-[#5A45FF] px-3 py-1.5 text-[24px] font-bold tracking-[-0.02em] text-[#111827] outline-none"
+                />
+                <button
+                  type="button"
+                  onClick={() => void handleSaveName()}
+                  disabled={isSavingName}
+                  className="shrink-0 rounded-lg bg-[#4B3BD4] px-3 py-2 text-[13px] font-semibold text-white hover:bg-[#3F2FBF] disabled:cursor-wait disabled:opacity-70"
+                >
+                  {isSavingName ? 'Saving...' : 'Save'}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setIsEditingName(false)}
+                  disabled={isSavingName}
+                  className="shrink-0 rounded-lg border border-[#DEE1E8] bg-white px-3 py-2 text-[13px] font-semibold text-[#374151] hover:bg-[#F9FAFB]"
+                >
+                  Cancel
+                </button>
+              </div>
+              {nameError ? <p role="alert" className="mt-1.5 text-[13px] text-[#B4232C]">{nameError}</p> : null}
+            </div>
+          ) : (
+            <div className="mt-0.5 flex items-center gap-2">
+              <h1 className="truncate text-[28px] font-bold tracking-[-0.02em] text-[#111827]">
+                {workspaceName || 'Untitled workspace'}
+              </h1>
+              {canManage ? (
+                <button
+                  type="button"
+                  onClick={openEditName}
+                  className="shrink-0 rounded-md px-2 py-1 text-[13px] font-medium text-[#4B3BD4] hover:bg-[#F8F7FF]"
+                >
+                  Edit
+                </button>
+              ) : null}
+            </div>
+          )}
+          <p className="mt-1 text-[14px] text-[#6B7280]">
+            Everyone here shares this workspace's decisions, blockers, and action items - each person connects their own tools.
+          </p>
+          {canManage && workspacePlan === 'self_serve' ? (
+            <p className="mt-1 text-[13px] text-[#9CA3AF]">
+              This is an individual account - it can't invite teammates. Create a separate team account to do that.
+            </p>
+          ) : null}
+        </div>
+        {canInvite ? (
+          <button
+            type="button"
+            onClick={openInvite}
+            className="shrink-0 rounded-lg bg-[#4B3BD4] px-4 py-2 text-[13px] font-semibold text-white transition-colors hover:bg-[#3F2FBF]"
+          >
+            Invite teammate
+          </button>
+        ) : null}
+      </div>
+
+      <div className="mt-8 overflow-hidden rounded-2xl border border-[#E8E8ED] bg-white shadow-[0_1px_2px_rgba(16,24,40,0.04)]">
+        {isLoading ? (
+          <p className="px-5 py-12 text-center text-[14px] text-[#6B7280]">Loading team...</p>
+        ) : (
+          members.map((member, index) => (
+            <div
+              key={member.membership_id}
+              className={`flex items-center justify-between gap-3 px-5 py-4 ${
+                index < members.length - 1 || invites.length > 0 ? 'border-b border-[#F0F0F4]' : ''
+              }`}
+            >
+              <div className="min-w-0">
+                <p className="truncate text-[14px] font-semibold text-[#111827]">
+                  {member.display_name ?? member.email ?? 'Team member'}
+                  {member.is_self ? <span className="ml-1.5 text-[13px] font-normal text-[#9CA3AF]">(you)</span> : null}
+                </p>
+                {member.display_name && member.email ? (
+                  <p className="truncate text-[13px] text-[#9CA3AF]">{member.email}</p>
+                ) : null}
+              </div>
+              <div className="flex shrink-0 items-center gap-2">
+                <span className="rounded-full bg-[#F3F4F6] px-2.5 py-1 text-[12px] font-medium capitalize text-[#4B5563]">
+                  {member.role}
+                </span>
+                {canManage && !member.is_self && member.role !== 'owner' ? (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setRemoveTarget(member)
+                      setRemoveError('')
+                    }}
+                    className="rounded-lg border border-[#DEE1E8] bg-white px-3 py-1.5 text-[13px] font-semibold text-[#DC2626] transition-colors hover:bg-[#FEF2F2]"
+                  >
+                    Remove
+                  </button>
+                ) : null}
+                {member.is_self && member.role !== 'owner' ? (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setIsLeaveOpen(true)
+                      setLeaveError('')
+                    }}
+                    className="rounded-lg border border-[#DEE1E8] bg-white px-3 py-1.5 text-[13px] font-semibold text-[#DC2626] transition-colors hover:bg-[#FEF2F2]"
+                  >
+                    Leave
+                  </button>
+                ) : null}
+              </div>
+            </div>
+          ))
+        )}
+
+        {invites.map((invite, index) => (
+          <div
+            key={invite.id}
+            className={`flex items-center justify-between gap-3 px-5 py-4 ${
+              index < invites.length - 1 ? 'border-b border-[#F0F0F4]' : ''
+            }`}
+          >
+            <div className="min-w-0">
+              <p className="truncate text-[14px] font-semibold text-[#111827]">{invite.email}</p>
+              <p className="text-[13px] text-[#9CA3AF]">Invited, not yet accepted</p>
+            </div>
+            <div className="flex shrink-0 items-center gap-2">
+              <span className="rounded-full bg-[#FEF3C7] px-2.5 py-1 text-[12px] font-medium capitalize text-[#92400E]">
+                Pending · {invite.role}
+              </span>
+              {canManage ? (
+                <button
+                  type="button"
+                  onClick={() => void handleRevoke(invite.id)}
+                  className="rounded-lg border border-[#DEE1E8] bg-white px-3 py-1.5 text-[13px] font-semibold text-[#DC2626] transition-colors hover:bg-[#FEF2F2]"
+                >
+                  Revoke
+                </button>
+              ) : null}
+            </div>
+          </div>
+        ))}
+      </div>
+
+      {error ? (
+        <p role="alert" className="mt-3 text-[13px] text-[#B4232C]">
+          {error}
+        </p>
+      ) : null}
+
+      {isInviteOpen ? (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/35 px-4"
+          role="presentation"
+          onMouseDown={(event) => {
+            if (event.target === event.currentTarget && !isInviting) setIsInviteOpen(false)
+          }}
+        >
+          <section
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="invite-teammate-title"
+            className="w-full max-w-[440px] rounded-[12px] bg-white p-6 shadow-[0_20px_55px_rgba(17,24,39,0.22)]"
+          >
+            <h2 id="invite-teammate-title" className="text-[18px] font-semibold text-[#111827]">
+              Invite a teammate
+            </h2>
+
+            {inviteResult ? (
+              <>
+                <p className="mt-2 text-[14px] leading-5 text-[#6B7280]">
+                  {inviteResult.emailSent
+                    ? `Invite sent to ${inviteEmail.trim()}. You can also share this link directly:`
+                    : "Couldn't send the email automatically - copy this link and send it yourself:"}
+                </p>
+                <div className="mt-3 flex items-center gap-2 rounded-lg border border-[#DEE1E8] bg-[#FAFAFB] px-3 py-2">
+                  <code className="min-w-0 flex-1 truncate text-[12px] text-[#111827]">{inviteResult.url}</code>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      void navigator.clipboard.writeText(inviteResult.url)
+                      setCopied(true)
+                    }}
+                    className="shrink-0 rounded-md border border-[#DEE1E8] bg-white px-2.5 py-1 text-[12px] font-semibold text-[#4B3BD4] hover:bg-[#F8F7FF]"
+                  >
+                    {copied ? 'Copied' : 'Copy'}
+                  </button>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setIsInviteOpen(false)}
+                  className="mt-5 w-full rounded-lg bg-[#4B3BD4] px-4 py-2.5 text-[14px] font-semibold text-white hover:bg-[#3F2FBF]"
+                >
+                  Done
+                </button>
+              </>
+            ) : (
+              <>
+                <p className="mt-2 text-[14px] leading-5 text-[#6B7280]">
+                  They'll join this workspace and share everything already captured here.
+                </p>
+
+                <label className="mt-4 block text-[13px] font-medium text-[#374151]">
+                  Email
+                  <input
+                    type="email"
+                    value={inviteEmail}
+                    onChange={(event) => setInviteEmail(event.target.value)}
+                    placeholder="teammate@company.com"
+                    className="mt-1.5 w-full rounded-lg border border-[#DEE1E8] px-3 py-2 text-[14px] text-[#111827] outline-none focus:border-[#5A45FF]"
+                  />
+                </label>
+
+                <label className="mt-3 block text-[13px] font-medium text-[#374151]">
+                  Role
+                  <select
+                    value={inviteRole}
+                    onChange={(event) => setInviteRole(event.target.value === 'admin' ? 'admin' : 'member')}
+                    className="mt-1.5 w-full rounded-lg border border-[#DEE1E8] px-3 py-2 text-[14px] text-[#111827] outline-none focus:border-[#5A45FF]"
+                  >
+                    <option value="member">Member</option>
+                    <option value="admin">Admin</option>
+                  </select>
+                </label>
+
+                {inviteError ? (
+                  <p role="alert" className="mt-2 text-[13px] text-[#B4232C]">
+                    {inviteError}
+                  </p>
+                ) : null}
+
+                <div className="mt-5 grid grid-cols-2 gap-2.5">
+                  <button
+                    type="button"
+                    onClick={() => setIsInviteOpen(false)}
+                    disabled={isInviting}
+                    className="rounded-lg border border-[#DEE1E8] bg-white px-4 py-2.5 text-[14px] font-semibold text-[#374151] hover:bg-[#F9FAFB] disabled:opacity-60"
+                  >
+                    Cancel
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => void handleInvite()}
+                    disabled={isInviting}
+                    className="rounded-lg bg-[#4B3BD4] px-4 py-2.5 text-[14px] font-semibold text-white hover:bg-[#3F2FBF] disabled:cursor-wait disabled:opacity-70"
+                  >
+                    {isInviting ? 'Sending...' : 'Send invite'}
+                  </button>
+                </div>
+              </>
+            )}
+          </section>
+        </div>
+      ) : null}
+
+      {removeTarget ? (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/35 px-4"
+          role="presentation"
+          onMouseDown={(event) => {
+            if (event.target === event.currentTarget && !isRemoving) setRemoveTarget(null)
+          }}
+        >
+          <section
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="remove-member-title"
+            className="w-full max-w-[400px] rounded-[12px] bg-white p-6 shadow-[0_20px_55px_rgba(17,24,39,0.22)]"
+          >
+            <h2 id="remove-member-title" className="text-[18px] font-semibold text-[#111827]">
+              Remove {removeTarget.display_name ?? removeTarget.email}?
+            </h2>
+            <p className="mt-2 text-[14px] leading-5 text-[#6B7280]">
+              They'll lose access to this workspace immediately. Anything they connected stays unless disconnected separately.
+            </p>
+            {removeError ? (
+              <p role="alert" className="mt-2 text-[13px] text-[#B4232C]">
+                {removeError}
+              </p>
+            ) : null}
+            <div className="mt-5 grid grid-cols-2 gap-2.5">
+              <button
+                type="button"
+                onClick={() => setRemoveTarget(null)}
+                disabled={isRemoving}
+                className="rounded-lg border border-[#DEE1E8] bg-white px-4 py-2.5 text-[14px] font-semibold text-[#374151] hover:bg-[#F9FAFB] disabled:opacity-60"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                onClick={() => void handleRemoveMember()}
+                disabled={isRemoving}
+                className="rounded-lg bg-[#DC2626] px-4 py-2.5 text-[14px] font-semibold text-white hover:bg-[#B91C1C] disabled:cursor-wait disabled:opacity-70"
+              >
+                {isRemoving ? 'Removing...' : 'Remove'}
+              </button>
+            </div>
+          </section>
+        </div>
+      ) : null}
+
+      {isLeaveOpen ? (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/35 px-4"
+          role="presentation"
+          onMouseDown={(event) => {
+            if (event.target === event.currentTarget && !isLeaving) setIsLeaveOpen(false)
+          }}
+        >
+          <section
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="leave-team-title"
+            className="w-full max-w-[400px] rounded-[12px] bg-white p-6 shadow-[0_20px_55px_rgba(17,24,39,0.22)]"
+          >
+            <h2 id="leave-team-title" className="text-[18px] font-semibold text-[#111827]">
+              Leave {workspaceName || 'this workspace'}?
+            </h2>
+            <p className="mt-2 text-[14px] leading-5 text-[#6B7280]">
+              You'll lose access immediately. Anything you personally connected (Gmail, Slack, etc.) will be
+              disconnected too - what's already been captured stays as the team's shared history.
+            </p>
+            {leaveError ? (
+              <p role="alert" className="mt-2 text-[13px] text-[#B4232C]">
+                {leaveError}
+              </p>
+            ) : null}
+            <div className="mt-5 grid grid-cols-2 gap-2.5">
+              <button
+                type="button"
+                onClick={() => setIsLeaveOpen(false)}
+                disabled={isLeaving}
+                className="rounded-lg border border-[#DEE1E8] bg-white px-4 py-2.5 text-[14px] font-semibold text-[#374151] hover:bg-[#F9FAFB] disabled:opacity-60"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                onClick={() => void handleLeaveTeam()}
+                disabled={isLeaving}
+                className="rounded-lg bg-[#DC2626] px-4 py-2.5 text-[14px] font-semibold text-white hover:bg-[#B91C1C] disabled:cursor-wait disabled:opacity-70"
+              >
+                {isLeaving ? 'Leaving...' : 'Leave'}
+              </button>
+            </div>
+          </section>
+        </div>
+      ) : null}
+    </>
+  )
+}
+
 function ConnectedSourcesSettings() {
   // Every real row for a source type, not just one - a tenant's own login
   // account and a connector account are already two separate things at the
@@ -540,7 +1119,7 @@ function ConnectedSourcesSettings() {
     github: [],
     monday: [],
     clickup: [],
-    outlook_calendar: [],
+    teams: [],
   })
   const [isLoading, setIsLoading] = useState(true)
   const [connectingId, setConnectingId] = useState<SourceId | null>(null)
@@ -555,14 +1134,38 @@ function ConnectedSourcesSettings() {
   // between (see lib/sourceConnections.ts's SyncMode doc) - Gmail and Slack
   // skip straight to handleConnect with no choice prompt.
   const [syncModeTarget, setSyncModeTarget] = useState<SourceId | null>(null)
+  const [sharedWorkspaceWarningTarget, setSharedWorkspaceWarningTarget] = useState<SourceId | null>(null)
+
+  // Real bug this closes: without this, every connection in the tenant
+  // looked identical regardless of who actually connected it - a teammate's
+  // Gmail read as if it were yours, with a working Disconnect button on it.
+  // Keyed by user_id (source_connections.connected_by), built from the same
+  // team-invites 'members' action TeamSettings above already uses.
+  const [memberMap, setMemberMap] = useState<Record<string, { name: string; isSelf: boolean }>>({})
+  const [canManageAll, setCanManageAll] = useState(false)
 
   const loadConnections = () =>
-    fetchSourceConnections().then((rows) => {
-      const next: Record<SourceId, SourceConnectionRow[]> = { slack: [], notion: [], gmail: [], jira: [], confluence: [], discord: [], github: [], monday: [], clickup: [], outlook_calendar: [] }
+    Promise.all([
+      fetchSourceConnections(),
+      invokeTeamInvites<{ members: TeamMember[] }>({ action: 'members' }),
+    ]).then(([rows, membersResult]) => {
+      const next: Record<SourceId, SourceConnectionRow[]> = { slack: [], notion: [], gmail: [], jira: [], confluence: [], discord: [], github: [], monday: [], clickup: [], teams: [] }
       for (const row of rows) {
         if (row.status === 'active') next[row.source].push(row)
       }
       setConnections(next)
+
+      // A solo/demo tenant with no real team-invites backing (or a
+      // transient failure loading it) shouldn't break the whole page -
+      // attribution just falls back to blank labels and every Disconnect
+      // button stays visible, same as before this feature existed.
+      const members = membersResult.data?.members ?? []
+      const map: Record<string, { name: string; isSelf: boolean }> = {}
+      for (const m of members) {
+        map[m.user_id] = { name: m.display_name ?? m.email ?? 'a teammate', isSelf: m.is_self }
+      }
+      setMemberMap(map)
+      setCanManageAll(members.find((m) => m.is_self)?.role !== 'member')
     })
 
   useEffect(() => {
@@ -598,6 +1201,22 @@ function ConnectedSourcesSettings() {
   }
 
   const openConnect = (sourceId: SourceId) => {
+    // Real risk this guards against: for every source except Gmail,
+    // external_workspace_id is the TEAM's shared identity (one Slack
+    // workspace, one ClickUp team), not a personal one - if this source
+    // already has an active connection and whoever's connecting now lands
+    // in that same external workspace, the unique(tenant_id, source,
+    // external_workspace_id) constraint means their reconnect silently
+    // takes over the existing row (new token, connected_by reassigned) with
+    // no warning to either person. Locus AI can't know in advance which
+    // exact workspace they'll land in - the provider only reveals that
+    // after OAuth completes - so this is a heads-up, not a precise
+    // per-workspace check. Gmail's identity IS the connecting email, so two
+    // people's own accounts never collide here - no warning needed.
+    if (sourceId !== 'gmail' && connections[sourceId].length > 0) {
+      setSharedWorkspaceWarningTarget(sourceId)
+      return
+    }
     // Every connect and reconnect asks what to read, for every source, not
     // just Notion reconnects - "I just connected Gmail, why isn't my old
     // mail here" was a real, repeated confusion (Gmail's connector only
@@ -680,6 +1299,11 @@ function ConnectedSourcesSettings() {
                   <div className="ml-14 flex flex-col gap-2">
                     {rows.map((row) => {
                       const label = connectionLabel(row)
+                      // null connected_by is every row from before this
+                      // column existed - stays unlabeled and manageable by
+                      // anyone, same as before this feature shipped.
+                      const owner = row.connected_by ? memberMap[row.connected_by] : undefined
+                      const canManageThis = !row.connected_by || owner?.isSelf || canManageAll
                       return (
                         <div
                           key={row.id}
@@ -692,14 +1316,21 @@ function ConnectedSourcesSettings() {
                             <span className="shrink-0 rounded-full bg-[#DCFCE7] px-2.5 py-1 text-[12px] font-medium text-[#16A34A]">
                               {formatConnectedSourceSync(row)}
                             </span>
+                            {owner ? (
+                              <span className="shrink-0 text-[12px] text-[#9CA3AF]">
+                                Connected by {owner.isSelf ? 'you' : owner.name}
+                              </span>
+                            ) : null}
                           </div>
-                          <button
-                            type="button"
-                            onClick={() => openDisconnectConfirm(row)}
-                            className="shrink-0 self-start rounded-lg border border-[#DEE1E8] bg-white px-3 py-1.5 text-[13px] font-semibold text-[#DC2626] transition-colors hover:bg-[#FEF2F2] sm:self-auto"
-                          >
-                            Disconnect
-                          </button>
+                          {canManageThis ? (
+                            <button
+                              type="button"
+                              onClick={() => openDisconnectConfirm(row)}
+                              className="shrink-0 self-start rounded-lg border border-[#DEE1E8] bg-white px-3 py-1.5 text-[13px] font-semibold text-[#DC2626] transition-colors hover:bg-[#FEF2F2] sm:self-auto"
+                            >
+                              Disconnect
+                            </button>
+                          ) : null}
                         </div>
                       )
                     })}
@@ -813,6 +1444,56 @@ function ConnectedSourcesSettings() {
                 className="h-10 rounded-lg bg-[#B4232C] text-[14px] font-semibold text-white hover:bg-[#981D24] disabled:cursor-wait disabled:opacity-60"
               >
                 {isDisconnecting ? 'Disconnecting...' : 'Disconnect'}
+              </button>
+            </div>
+          </section>
+        </div>
+      ) : null}
+
+      {sharedWorkspaceWarningTarget ? (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/35 px-4"
+          role="presentation"
+          onMouseDown={(event) => {
+            if (event.target === event.currentTarget) setSharedWorkspaceWarningTarget(null)
+          }}
+        >
+          <section
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="shared-workspace-warning-title"
+            className="w-full max-w-[440px] rounded-[12px] bg-white p-6 shadow-[0_20px_55px_rgba(17,24,39,0.22)]"
+          >
+            <h2 id="shared-workspace-warning-title" className="text-[18px] font-semibold text-[#111827]">
+              Already connected
+            </h2>
+            <p className="mt-2 text-[14px] leading-5 text-[#6B7280]">
+              This source already has an active connection for your team. If you're connecting the same {' '}
+              {CONNECTED_SOURCE_META.find((s) => s.id === sharedWorkspaceWarningTarget)?.name}, continuing will take
+              over as the one managing it - the previous connection's access is replaced, not added to.
+            </p>
+            <p className="mt-2 text-[13px] leading-5 text-[#9CA3AF]">
+              Connecting a genuinely different workspace/account is fine - this warning shows either way, since we
+              can't tell which one you'll land in until after you sign in.
+            </p>
+            <div className="mt-5 grid grid-cols-2 gap-2.5">
+              <button
+                type="button"
+                onClick={() => setSharedWorkspaceWarningTarget(null)}
+                className="rounded-lg border border-[#DEE1E8] bg-white px-4 py-2.5 text-[14px] font-semibold text-[#374151] hover:bg-[#F9FAFB]"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  const sourceId = sharedWorkspaceWarningTarget
+                  setSharedWorkspaceWarningTarget(null)
+                  if (sourceId) setSyncModeTarget(sourceId)
+                }}
+                className="rounded-lg bg-[#4B3BD4] px-4 py-2.5 text-[14px] font-semibold text-white hover:bg-[#3F2FBF]"
+              >
+                Continue
               </button>
             </div>
           </section>
@@ -1305,6 +1986,8 @@ export default function SettingsPage() {
       <main className="min-w-0 flex-1">
         {activeSection === 'Account' ? (
           <AccountSettings />
+        ) : activeSection === 'Team' ? (
+          <TeamSettings />
         ) : activeSection === 'Connected Sources' ? (
           <ConnectedSourcesSettings />
         ) : activeSection === 'Build Memory' ? (

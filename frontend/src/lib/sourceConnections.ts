@@ -9,7 +9,7 @@ import { getTenantId } from './api'
  * slack-oauth / notion-oauth / gmail-oauth Edge Functions' popup flow.
  */
 
-export type SourceId = 'slack' | 'notion' | 'gmail' | 'jira' | 'confluence' | 'discord' | 'github' | 'monday' | 'clickup' | 'outlook_calendar'
+export type SourceId = 'slack' | 'notion' | 'gmail' | 'jira' | 'confluence' | 'discord' | 'github' | 'monday' | 'clickup' | 'teams'
 
 export interface SourceConnectionRow {
   id: string
@@ -21,6 +21,11 @@ export interface SourceConnectionRow {
   /** Human-readable label - Gmail's email again, Slack's team name, Notion's workspace name.
    * Null for rows connected before this column existed. */
   display_name: string | null
+  /** Who connected this - null for every row that predates this column
+   * (see 20260901160000_source_connections_attribution.sql), treated as
+   * "still manageable by anyone" wherever this matters (Settings' own
+   * Disconnect button, capture-source-rules' server-side check). */
+  connected_by: string | null
 }
 
 const SUPABASE_URL = (import.meta.env.VITE_SUPABASE_URL as string | undefined) ?? ''
@@ -40,7 +45,7 @@ function isOAuthMessage(value: unknown): value is OAuthMessage {
     (message.source === 'slack' || message.source === 'notion' || message.source === 'gmail' ||
       message.source === 'jira' || message.source === 'confluence' || message.source === 'discord' ||
       message.source === 'github' || message.source === 'monday' || message.source === 'clickup' ||
-      message.source === 'outlook_calendar') &&
+      message.source === 'teams') &&
     typeof message.success === 'boolean'
   )
 }
@@ -49,7 +54,7 @@ export async function fetchSourceConnections(): Promise<SourceConnectionRow[]> {
   const tenantId = await getTenantId()
   const { data, error } = await getSupabaseClient()
     .from('source_connections')
-    .select('id, source, status, last_synced_at, external_workspace_id, display_name')
+    .select('id, source, status, last_synced_at, external_workspace_id, display_name, connected_by')
     .eq('tenant_id', tenantId)
 
   if (error) throw error

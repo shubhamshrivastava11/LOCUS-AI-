@@ -9,7 +9,7 @@ import { redactFinancialInfoDeep } from "./financialRedaction.ts";
 
 export interface IngestionEnvelope {
   tenant_id: string;
-  source: "slack" | "gmail" | "notion" | "jira" | "confluence" | "discord" | "github" | "monday" | "clickup" | "outlook_calendar";
+  source: "slack" | "gmail" | "notion" | "jira" | "confluence" | "discord" | "github" | "monday" | "clickup" | "teams";
   source_id: string;
   actor: string;
   thread_ref: string;
@@ -57,6 +57,25 @@ export interface IngestionEnvelope {
   // resolve, never guesses. Generic, not Jira/Confluence-specific -
   // any connector with structured participant data can set this.
   known_actors?: { name: string; source_actor_id: string }[];
+  // The id of the channel / project / space / label / board / repo this
+  // event came from, in the SAME id space Build Memory lists and stores
+  // rules against (capture_source_rules.item_id). ai-worker drops the
+  // event when the tenant has switched that item off.
+  //
+  // Deliberately NOT permission_scope, which looks similar and is not:
+  // permission_scope is load-bearing for search access control
+  // (isDecisionAccessible), and most connectors put a workspace or account
+  // id in it rather than the per-item id Build Memory shows. Overloading it
+  // would couple a settings toggle to the security model.
+  //
+  // Optional on purpose - a connector that does not set it is captured
+  // unconditionally, exactly as before this field existed.
+  //
+  // A list where one event genuinely belongs to several items at once:
+  // a Gmail message carries every label applied to it, and the tenant may
+  // have switched any one of them off. Single-item connectors pass a
+  // string and behave identically.
+  capture_item_id?: string | string[];
 }
 
 export async function enqueueEvent(envelope: IngestionEnvelope) {

@@ -6,7 +6,7 @@
 import { withAdmin } from "./db.ts";
 import { getServiceClient } from "./supabase.ts";
 
-export type SourceKind = "slack" | "notion" | "gmail" | "jira" | "confluence" | "discord" | "github" | "monday" | "clickup" | "outlook_calendar";
+export type SourceKind = "slack" | "notion" | "gmail" | "jira" | "confluence" | "discord" | "github" | "monday" | "clickup" | "teams";
 
 const UUID_RE =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
@@ -28,8 +28,11 @@ function isUuid(value: string): boolean {
 /**
  * Validate tenant_id + access_token on /authorize.
  * Verifies the Supabase Auth JWT and that the user is a member of the tenant.
+ * Returns userId too (previously verified then discarded) so callers can
+ * carry it through OAuth state and record who actually connected a source -
+ * see encodeState/parseTenantState and source_connections.connected_by.
  */
-export async function resolveTenantFromAuthorize(url: URL): Promise<string> {
+export async function resolveTenantFromAuthorize(url: URL): Promise<{ tenantId: string; userId: string }> {
   const tenantId = url.searchParams.get("tenant_id")?.trim() ?? "";
   const accessToken = url.searchParams.get("access_token")?.trim() ?? "";
 
@@ -42,7 +45,7 @@ export async function resolveTenantFromAuthorize(url: URL): Promise<string> {
 
   const userId = await verifyAccessToken(accessToken);
   await assertMembership(userId, tenantId);
-  return tenantId;
+  return { tenantId, userId };
 }
 
 async function verifyAccessToken(accessToken: string): Promise<string> {
@@ -109,38 +112,43 @@ export function resolveRedirectOrigin(url: URL): string {
 // never reads this field even though it flows through the same state.
 export type SyncMode = "full" | "new";
 
-/** Carries tenant_id + the resolved redirect origin (+ optional sync mode) through the provider's OAuth `state` round trip. */
-export function encodeState(tenantId: string, redirectOrigin: string, syncMode?: SyncMode): string {
-  return btoa(JSON.stringify({ t: tenantId, o: redirectOrigin, m: syncMode }));
+/** Carries tenant_id + userId + the resolved redirect origin (+ optional sync mode) through the provider's OAuth `state` round trip. */
+export function encodeState(tenantId: string, userId: string, redirectOrigin: string, syncMode?: SyncMode): string {
+  return btoa(JSON.stringify({ t: tenantId, u: userId, o: redirectOrigin, m: syncMode }));
 }
 
-/** Read and validate tenant_id + redirect origin (+ optional sync mode) carried in the provider OAuth `state` param. */
+/** Read and validate tenant_id + userId + redirect origin (+ optional sync mode) carried in the provider OAuth `state` param. */
 export function parseTenantState(
   state: string | null,
-): { tenantId: string; redirectOrigin: string; syncMode: SyncMode } {
+): { tenantId: string; userId: string; redirectOrigin: string; syncMode: SyncMode } {
   if (!state) {
     throw new OAuthTenantError("Missing OAuth state");
   }
 
   let tenantId = "";
+  let userId = "";
   let redirectOrigin = DEFAULT_FRONTEND_URL;
   let syncMode: SyncMode = "full";
   try {
-    const parsed = JSON.parse(atob(state)) as { t?: string; o?: string; m?: string };
+    const parsed = JSON.parse(atob(state)) as { t?: string; u?: string; o?: string; m?: string };
     tenantId = parsed.t?.trim() ?? "";
+    userId = parsed.u?.trim() ?? "";
     if (parsed.o && ALLOWED_FRONTEND_ORIGINS.includes(parsed.o)) {
       redirectOrigin = parsed.o;
     }
     if (parsed.m === "new") syncMode = "new";
   } catch {
-    // Back-compat: older links encoded state as a bare tenant_id UUID.
+    // Back-compat: older links encoded state as a bare tenant_id UUID, from
+    // before userId was carried through at all - connected_by lands null
+    // for a callback completed from one of these, same as any other
+    // pre-attribution row.
     tenantId = state.trim();
   }
 
   if (!tenantId || !isUuid(tenantId)) {
     throw new OAuthTenantError("Missing or invalid OAuth state (tenant_id)");
   }
-  return { tenantId, redirectOrigin, syncMode };
+  return { tenantId, userId, redirectOrigin, syncMode };
 }
 
 /**

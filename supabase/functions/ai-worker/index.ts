@@ -40,6 +40,11 @@ const INGESTION_BATCH = 40;
 const EMBEDDING_BATCH = 40;
 const CONCURRENCY = 8;
 const VISIBILITY_TIMEOUT_SECONDS = 60;
+// How many times an embedding job may fail before it is abandoned. Bounded
+// deliberately: unbounded retry is what once let a single poisonous message
+// block a queue for 19 hours, and zero retry is what silently lost 62
+// decisions from semantic search. See handleEmbeddingMessage's catch.
+const MAX_EMBEDDING_ATTEMPTS = 5;
 
 // ── Encryption (matches modules.security.encryption exactly) ─────────────
 // AES-256-GCM, key = SHA-256(secret), blob = "LOCUS1" + 12-byte nonce +
@@ -685,12 +690,6 @@ const ACTOR_IDENTIFIER_COLUMN: Record<string, string> = {
   github: "github_user_id",
   monday: "monday_user_id",
   clickup: "clickup_user_id",
-  // Reuses the same "email" column Gmail already indexes, not a new
-  // column - a Microsoft Calendar organizer/attendee identity IS an
-  // email address, the exact same identifier space. This also means
-  // the same real person shows up as one actor across Gmail and
-  // Outlook Calendar, not two - a genuine improvement, not a shortcut.
-  outlook_calendar: "email",
 };
 
 // deno-lint-ignore no-explicit-any
@@ -851,6 +850,43 @@ async function handleIngestionMessage(msg: PgmqMsg): Promise<string> {
   }
 }
 
+/**
+ * Whether the tenant has switched this specific item off in Build Memory.
+ *
+ * Absent row means included, matching the `?? true` default the
+ * capture-source-rules list endpoint already shows people - a tenant who
+ * has never touched a toggle has no rows at all.
+ */
+async function isCaptureExcluded(
+  tenantId: string,
+  source: string,
+  itemIds: string[],
+): Promise<boolean> {
+  if (itemIds.length === 0) return false;
+  try {
+    const rows = await withTenant(tenantId, async (sql) => {
+      return await sql`
+        SELECT included FROM public.capture_source_rules
+        WHERE tenant_id = ${tenantId} AND source = ${source}
+          AND item_id = ANY(${itemIds})
+          AND included = false
+        LIMIT 1
+      `;
+    });
+    // ANY switched-off item excludes the event. For a Gmail message
+    // carrying several labels that means one muted label is enough to keep
+    // it out - the reading that honours an explicit "do not capture this",
+    // rather than letting a second label quietly override it.
+    return rows.length > 0;
+  } catch (err) {
+    // Fail open: a database blip must never silently stop capturing a
+    // source the tenant believes is switched on. Losing data invisibly is
+    // worse than capturing one event they meant to exclude.
+    console.error("Capture rule lookup failed, defaulting to captured:", err);
+    return false;
+  }
+}
+
 async function handleIngestionMessageInner(msg: PgmqMsg): Promise<string> {
   const payload = msg.message as {
     tenant_id: string; source: string; source_id: string; actor: string;
@@ -858,6 +894,7 @@ async function handleIngestionMessageInner(msg: PgmqMsg): Promise<string> {
     source_permalink?: string | null; received_at: string; actor_display_name?: string;
     connection_id?: string; likely_bulk_mail?: boolean;
     known_actors?: { name: string; source_actor_id: string }[];
+    capture_item_id?: string | string[];
   };
   const tenantId = payload.tenant_id;
 
@@ -885,6 +922,33 @@ async function handleIngestionMessageInner(msg: PgmqMsg): Promise<string> {
     // messages" literally.
     await pgmqDelete("ingestion", msg.msg_id);
     return "learning_paused";
+  }
+
+  // Settings > Build Memory's per-item include toggles. Same class of bug
+  // as "Pause all learning" directly above, found the same way:
+  // capture_source_rules was written by the Settings UI and read back by
+  // it, but nothing in any ingestion path ever consulted it, so switching
+  // a channel off changed what that page displayed and nothing else.
+  //
+  // Enforced here rather than in each connector so there is exactly one
+  // enforcement point, keyed on capture_item_id - see that field's comment
+  // in _shared/queue.ts for why it must not be permission_scope.
+  //
+  // Fails open in every direction: no capture_item_id, no rule row, or a
+  // failed lookup all mean capture. A connector not yet wired to set
+  // capture_item_id behaves exactly as it did before this existed, so
+  // shipping this cannot silently stop any source being ingested.
+  const captureItemIds = payload.capture_item_id === undefined
+    ? []
+    : (Array.isArray(payload.capture_item_id) ? payload.capture_item_id : [payload.capture_item_id]);
+  if (captureItemIds.length > 0) {
+    const excluded = await isCaptureExcluded(tenantId, payload.source, captureItemIds);
+    if (excluded) {
+      // Dropped for $0 before dedup, encryption or any Claude call, the
+      // same way a paused tenant's events are.
+      await pgmqDelete("ingestion", msg.msg_id);
+      return "capture_rule_excluded";
+    }
   }
 
   // is_duplicate(): only a row already marked pipeline_status='done' counts
@@ -1424,9 +1488,26 @@ async function handleEmbeddingMessage(msg: PgmqMsg): Promise<string> {
     await pgmqDelete("embedding_queue", msg.msg_id);
     return "embedded";
   } catch (err) {
-    // Delete message on ANY error to prevent retry loops
+    // Deleting on ANY error is how 62 Notion decisions ended up permanently
+    // invisible to semantic search: one transient Voyage failure during a
+    // single batch and every job in it was dropped for good. The decision
+    // rows survived, their embeddings were never written, and nothing ever
+    // retried - so they stayed keyword-searchable and vector-invisible,
+    // silently, for a month.
+    //
+    // Leaving the message queued lets pgmq redeliver it after the
+    // visibility timeout. read_ct bounds that, so the failure this delete
+    // was originally guarding against - one bad message retrying forever
+    // ahead of every other job - still cannot happen.
+    if (msg.read_ct < MAX_EMBEDDING_ATTEMPTS) {
+      console.error(
+        `Embedding error (attempt ${msg.read_ct}/${MAX_EMBEDDING_ATTEMPTS}), left queued for retry:`,
+        err,
+      );
+      return "error_retrying";
+    }
     await pgmqDelete("embedding_queue", msg.msg_id);
-    console.error("Embedding error, message deleted to prevent retry loop:", err);
+    console.error(`Embedding failed ${MAX_EMBEDDING_ATTEMPTS} times, message deleted:`, err);
     return "error_deleted";
   }
 }

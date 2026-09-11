@@ -27,6 +27,16 @@ export function getSupabaseClient() {
       autoRefreshToken: true,
       detectSessionInUrl: false,
     },
+    global: {
+      // Pins Edge Function execution to the database's own region. Without
+      // it, functions run near the user and every database round trip
+      // crosses an ocean - measured at 7,422ms vs 133ms for identical work
+      // (see FUNCTION_REGION in lib/api.ts for the full reasoning).
+      //
+      // Harmless on the PostgREST calls this client also makes: those are
+      // served alongside the database already and simply ignore the header.
+      headers: { 'x-region': 'us-west-1' },
+    },
   })
 
   return supabase

@@ -27,11 +27,12 @@ import { getServiceClient } from "../_shared/supabase.ts";
 import { decryptToken } from "../_shared/tokenCrypto.ts";
 import { refreshAtlassianAccess, type AtlassianConnection } from "../_shared/atlassianAuth.ts";
 import { githubApiHeaders, mintInstallationToken } from "../_shared/githubAuth.ts";
+import { Trace } from "../_shared/trace.ts";
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Headers":
-    "authorization, x-client-info, apikey, content-type",
+    "authorization, x-client-info, apikey, content-type, x-region",
   "Access-Control-Allow-Methods": "POST, OPTIONS",
 };
 
@@ -42,7 +43,7 @@ function jsonResponse(body: Record<string, unknown>, status: number) {
   });
 }
 
-type Source = "slack" | "gmail" | "notion" | "jira" | "confluence" | "discord" | "github" | "monday" | "clickup" | "outlook_calendar";
+type Source = "slack" | "gmail" | "notion" | "jira" | "confluence" | "discord" | "github" | "monday" | "clickup" | "teams";
 type RealItem = { source: Source; item_id: string; item_name: string };
 
 const DISCORD_BOT_TOKEN = Deno.env.get("DISCORD_BOT_TOKEN");
@@ -125,16 +126,6 @@ async function fetchRealItems(source: Source, accessToken: string, cloudId?: str
     const data = await resp.json();
     const spaces = (data.results ?? []) as { id: number; key: string; name: string }[];
     return spaces.map((s) => ({ source: "confluence" as const, item_id: String(s.id), item_name: s.name }));
-  }
-
-  if (source === "outlook_calendar") {
-    // A single personal calendar has no real "channel"-equivalent
-    // sub-items the way Slack/Gmail/Discord/GitHub/Monday/ClickUp do -
-    // the source-level connect/disconnect already controls whether it's
-    // captured at all. Explicit early return, not a fallthrough to the
-    // Gmail-labels fetch below (which would silently misfire a Gmail
-    // API call using a Microsoft access token otherwise).
-    return [];
   }
 
   if (source === "notion") {
@@ -250,7 +241,7 @@ Deno.serve(async (req: Request) => {
 
   const { data: membership } = await supabase
     .from("memberships")
-    .select("tenant_id")
+    .select("tenant_id, role")
     .eq("user_id", user.id)
     .limit(1)
     .maybeSingle();
@@ -259,6 +250,7 @@ Deno.serve(async (req: Request) => {
     return jsonResponse({ error: "No tenant membership found" }, 403);
   }
   const tenantId = membership.tenant_id as string;
+  const callerRole = membership.role as string;
 
   let body: Record<string, unknown>;
   try {
@@ -269,18 +261,27 @@ Deno.serve(async (req: Request) => {
   const action = String(body.action ?? "");
 
   if (action === "list") {
+    // Traced because this endpoint was slow and nothing measured it: the
+    // provider fan-out and the two database reads are now separable in
+    // request_traces rather than a single opaque wall-clock number.
+    const trace = new Trace();
     const { data: sources } = await supabase
       .from("source_connections")
       .select("id, tenant_id, source, oauth_token_ref, external_workspace_id, cursor_state")
       .eq("tenant_id", tenantId)
       .eq("status", "active");
+    trace.mark("load_connections");
 
-    // A tenant can have more than one active connection for the same
-    // source (e.g. two Gmail accounts) - dedupe by (source, item_id) so the
-    // same channel/page/label/project/space fetched from multiple
-    // connections doesn't show up multiple times.
-    const itemsByKey = new Map<string, RealItem>();
-    for (const row of sources ?? []) {
+    // Every connection here is a live third-party API call - Slack
+    // conversations.list, Notion search, Gmail labels, Jira projects,
+    // Confluence spaces, Discord channels, GitHub repos, Monday boards,
+    // ClickUp spaces - and they were awaited one after another, so opening
+    // Build Memory cost the SUM of every connected provider's response
+    // time. Nine connectors meant nine round trips in series. They don't
+    // depend on each other, so they now run together and the page costs the
+    // slowest single provider instead of all of them added up.
+    const connections = sources ?? [];
+    const perConnection = await Promise.all(connections.map(async (row) => {
       const source = row.source as Source;
       try {
         if (source === "jira" || source === "confluence") {
@@ -294,40 +295,70 @@ Deno.serve(async (req: Request) => {
             oauth_token_ref: row.oauth_token_ref as string | null,
             cursor_state: row.cursor_state as AtlassianConnection["cursor_state"],
           });
-          if (!refreshed) continue;
-          for (const item of await fetchRealItems(source, refreshed.accessToken, refreshed.cloudId)) {
-            itemsByKey.set(`${item.source}:${item.item_id}`, item);
-          }
-          continue;
+          if (!refreshed) return [];
+          return await fetchRealItems(source, refreshed.accessToken, refreshed.cloudId);
         }
         if (source === "discord") {
-          for (const item of await fetchDiscordChannels(row.external_workspace_id as string)) {
-            itemsByKey.set(`${item.source}:${item.item_id}`, item);
-          }
-          continue;
+          return await fetchDiscordChannels(row.external_workspace_id as string);
+        }
+        if (source === "teams") {
+          // The one source with no provider call to make. Graph has no
+          // "which channels may this app see" endpoint - with
+          // ChannelMessage.Read.All the answer is all of them - so the
+          // list is built from channels Locus has actually heard from,
+          // recorded by teams-webhook as messages arrive.
+          //
+          // Honest consequence: a channel appears here after its first
+          // captured message, not at connect time. Every other source is
+          // complete the moment it is connected.
+          const channels =
+            (row.cursor_state as { channels?: Record<string, { name?: string | null; team?: string | null }> } | null)
+              ?.channels ?? {};
+          return Object.entries(channels).map(([itemId, info]) => {
+            const channelName = info?.name ?? "General";
+            return {
+              source: "teams" as Source,
+              item_id: itemId,
+              item_name: info?.team ? `${info.team} / ${channelName}` : channelName,
+            };
+          });
         }
         if (source === "github") {
           const installationId = (row.cursor_state as { installation_id?: number } | null)?.installation_id;
-          if (!installationId) continue;
-          for (const item of await fetchGithubRepos(String(installationId))) {
-            itemsByKey.set(`${item.source}:${item.item_id}`, item);
-          }
-          continue;
+          if (!installationId) return [];
+          return await fetchGithubRepos(String(installationId));
         }
         const accessToken = await decryptToken(row.oauth_token_ref as string | null);
-        if (!accessToken) continue;
+        if (!accessToken) return [];
         // ClickUp's team_id lives in external_workspace_id, reused
         // through the same "extra per-connection id" param Jira/
         // Confluence already pass their cloudId through - no need for
         // a new parameter just for this source.
-        for (const item of await fetchRealItems(source, accessToken, row.external_workspace_id as string | undefined)) {
-          itemsByKey.set(`${item.source}:${item.item_id}`, item);
-        }
+        return await fetchRealItems(source, accessToken, row.external_workspace_id as string | undefined);
       } catch (err) {
+        // One provider being down or slow must not blank out the other
+        // eight - the same per-connection isolation the sequential version
+        // had, kept deliberately: Promise.all would otherwise reject the
+        // whole list on a single failure.
         console.error(`Failed to fetch real items for ${source}:`, err);
+        return [] as RealItem[];
+      }
+    }));
+
+    // A tenant can have more than one active connection for the same
+    // source (e.g. two Gmail accounts) - dedupe by (source, item_id) so the
+    // same channel/page/label/project/space fetched from multiple
+    // connections doesn't show up multiple times. Applied in connection
+    // order rather than completion order, so which duplicate wins stays
+    // exactly what it was before these ran concurrently.
+    const itemsByKey = new Map<string, RealItem>();
+    for (const items of perConnection) {
+      for (const item of items) {
+        itemsByKey.set(`${item.source}:${item.item_id}`, item);
       }
     }
     const realItems = Array.from(itemsByKey.values());
+    trace.mark("fetch_provider_items");
 
     const { data: rules, error: rulesError } = await supabase
       .from("capture_source_rules")
@@ -348,6 +379,9 @@ Deno.serve(async (req: Request) => {
       ...item,
       included: ruleMap.get(`${item.source}:${item.item_id}`) ?? true,
     }));
+
+    trace.mark("load_rules_and_build");
+    void trace.write(tenantId, "POST capture-source-rules:list");
 
     return jsonResponse({ items }, 200);
   }
@@ -386,6 +420,32 @@ Deno.serve(async (req: Request) => {
     const deleteHistory = Boolean(body.delete_history);
     if (!connectionId) {
       return jsonResponse({ error: "connection_id is required" }, 400);
+    }
+
+    // Real bug this closes: any tenant member could disconnect ANY other
+    // member's connection, with nothing distinguishing "mine" from
+    // "theirs" - only the person who connected it, or a workspace
+    // owner/admin, can disconnect it. connected_by null (every row that
+    // predates this column) is treated as still-manageable-by-anyone, same
+    // as before this check existed - it never locks out a legacy
+    // connection nobody can prove ownership of.
+    const { data: target } = await supabase
+      .from("source_connections")
+      .select("connected_by")
+      .eq("id", connectionId)
+      .eq("tenant_id", tenantId)
+      .maybeSingle();
+    if (!target) {
+      return jsonResponse({ error: "Connection not found" }, 404);
+    }
+    if (
+      target.connected_by &&
+      target.connected_by !== user.id &&
+      callerRole === "member"
+    ) {
+      return jsonResponse({
+        error: "Only the person who connected this, or a workspace owner/admin, can disconnect it",
+      }, 403);
     }
 
     // Revoke first, unconditionally - stops new ingestion immediately

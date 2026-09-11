@@ -3,6 +3,17 @@ export const DEMO_EMAIL_KEY = 'locus:demo-email'
 export const WORKSPACES_DONE_KEY = 'locus:workspaces-connected'
 
 /**
+ * Holds a pending team-invite token across the Google OAuth round trip -
+ * signInWithOAuth's redirectTo is a single fixed callback URL shared by
+ * every sign-in path, so it can't carry custom state through Google's
+ * redirect itself. JoinTeam.tsx sets this right before starting sign-in;
+ * OAuthCallback.tsx checks it right after the session is established, and
+ * always clears it whether accept succeeds or fails, so a leftover token
+ * never resurfaces on some later, unrelated sign-in.
+ */
+export const PENDING_INVITE_TOKEN_KEY = 'locus:pending-invite-token'
+
+/**
  * localStorage (not sessionStorage - should survive a browser restart, same
  * as a real "seen" flag would) marking that the user has opened Team Pulse
  * at least once. TeamPulse sets it on mount and dispatches

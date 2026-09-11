@@ -59,7 +59,7 @@ Deno.serve(async (req: Request) => {
     const redirectOrigin = resolveRedirectOrigin(url);
     const syncMode = url.searchParams.get("sync_mode") === "new" ? "new" : "full";
     try {
-      const tenantId = await resolveTenantFromAuthorize(url);
+      const { tenantId, userId } = await resolveTenantFromAuthorize(url);
       await enforceRouteRateLimit(tenantId, "jira-oauth");
 
       const authorizeUrl = new URL("https://auth.atlassian.com/authorize");
@@ -67,7 +67,7 @@ Deno.serve(async (req: Request) => {
       authorizeUrl.searchParams.set("client_id", CLIENT_ID ?? "");
       authorizeUrl.searchParams.set("scope", SCOPES);
       authorizeUrl.searchParams.set("redirect_uri", REDIRECT_URI ?? "");
-      authorizeUrl.searchParams.set("state", encodeState(tenantId, redirectOrigin, syncMode));
+      authorizeUrl.searchParams.set("state", encodeState(tenantId, userId, redirectOrigin, syncMode));
       authorizeUrl.searchParams.set("response_type", "code");
       // Always show the consent screen, even for a user who's already
       // granted this app access before - a stale silent re-auth could
@@ -85,10 +85,11 @@ Deno.serve(async (req: Request) => {
   // GET /callback: exchange code, resolve the granted site, store the connection
   if (url.pathname.endsWith("/callback")) {
     let tenantId: string;
+    let userId: string;
     let redirectOrigin: string;
     let syncMode: "full" | "new";
     try {
-      ({ tenantId, redirectOrigin, syncMode } = parseTenantState(url.searchParams.get("state")));
+      ({ tenantId, userId, redirectOrigin, syncMode } = parseTenantState(url.searchParams.get("state")));
     } catch (err) {
       return authorizeErrorResponse(SOURCE, err, resolveRedirectOrigin(url));
     }
@@ -152,7 +153,7 @@ Deno.serve(async (req: Request) => {
           await sql`
             insert into public.source_connections (
               tenant_id, source, external_workspace_id, display_name, oauth_token_ref,
-              ingestion_mode, status, cursor_state, last_synced_at
+              ingestion_mode, status, cursor_state, last_synced_at, connected_by
             ) values (
               ${tenantId}::uuid,
               'jira',
@@ -166,7 +167,8 @@ Deno.serve(async (req: Request) => {
                 cloud_id: site.id,
                 site_url: site.url,
               })},
-              ${lastSyncedAt}
+              ${lastSyncedAt},
+              ${userId || null}::uuid
             )
             on conflict (tenant_id, source, external_workspace_id)
             do update set
@@ -175,7 +177,8 @@ Deno.serve(async (req: Request) => {
               status = 'active',
               cursor_state = excluded.cursor_state,
               ingestion_mode = excluded.ingestion_mode,
-              last_synced_at = excluded.last_synced_at
+              last_synced_at = excluded.last_synced_at,
+              connected_by = excluded.connected_by
           `;
         });
       } catch (err) {

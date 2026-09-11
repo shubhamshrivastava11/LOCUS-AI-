@@ -112,7 +112,7 @@ Deno.serve(async (req: Request) => {
     const redirectOrigin = resolveRedirectOrigin(url);
     const syncMode = url.searchParams.get("sync_mode") === "new" ? "new" : "full";
     try {
-      const tenantId = await resolveTenantFromAuthorize(url);
+      const { tenantId, userId } = await resolveTenantFromAuthorize(url);
       await enforceRouteRateLimit(tenantId, "slack-oauth");
 
       const slackAuthUrl = new URL("https://slack.com/oauth/v2/authorize");
@@ -133,7 +133,7 @@ Deno.serve(async (req: Request) => {
         "channels:history,groups:history,im:history,mpim:history,chat:write,channels:read,groups:read,mpim:read,im:read,users:read,users:read.email",
       );
       slackAuthUrl.searchParams.set("redirect_uri", REDIRECT_URI ?? "");
-      slackAuthUrl.searchParams.set("state", encodeState(tenantId, redirectOrigin, syncMode));
+      slackAuthUrl.searchParams.set("state", encodeState(tenantId, userId, redirectOrigin, syncMode));
 
       return Response.redirect(slackAuthUrl.toString(), 302);
     } catch (err) {
@@ -143,10 +143,11 @@ Deno.serve(async (req: Request) => {
 
   if (url.pathname.endsWith("/callback")) {
     let tenantId: string;
+    let userId: string;
     let redirectOrigin: string;
     let syncMode: "full" | "new";
     try {
-      ({ tenantId, redirectOrigin, syncMode } = parseTenantState(url.searchParams.get("state")));
+      ({ tenantId, userId, redirectOrigin, syncMode } = parseTenantState(url.searchParams.get("state")));
     } catch (err) {
       return authorizeErrorResponse(SOURCE, err, resolveRedirectOrigin(url));
     }
@@ -192,7 +193,7 @@ Deno.serve(async (req: Request) => {
         await sql`
           insert into public.source_connections (
             tenant_id, source, external_workspace_id, display_name, oauth_token_ref,
-            ingestion_mode, status, cursor_state
+            ingestion_mode, status, cursor_state, connected_by
           ) values (
             ${tenantId}::uuid,
             'slack',
@@ -201,7 +202,8 @@ Deno.serve(async (req: Request) => {
             ${encryptedToken},
             'realtime',
             'active',
-            ${sql.json({ bot_user_id: tokenData.bot_user_id ?? null })}::jsonb
+            ${sql.json({ bot_user_id: tokenData.bot_user_id ?? null })}::jsonb,
+            ${userId || null}::uuid
           )
           on conflict (tenant_id, source, external_workspace_id)
           do update set
@@ -209,7 +211,8 @@ Deno.serve(async (req: Request) => {
             display_name = excluded.display_name,
             status = 'active',
             cursor_state = excluded.cursor_state,
-            ingestion_mode = excluded.ingestion_mode
+            ingestion_mode = excluded.ingestion_mode,
+            connected_by = excluded.connected_by
         `;
       });
     } catch (err) {

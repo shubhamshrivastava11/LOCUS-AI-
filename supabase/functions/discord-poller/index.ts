@@ -148,6 +148,9 @@ Deno.serve(async (_req) => {
             actor_display_name: message.author.global_name || message.author.username,
             thread_ref: channel.id,
             permission_scope: [],
+            // Build Memory's toggle key for this source (see
+            // capture_item_id in _shared/queue.ts).
+            capture_item_id: channel.id,
             raw_content: {
               subject: channel.name ? `#${channel.name}` : "",
               body: message.content,

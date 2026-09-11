@@ -29,7 +29,7 @@ Deno.serve(async (req: Request) => {
     const redirectOrigin = resolveRedirectOrigin(url);
     const syncMode = url.searchParams.get("sync_mode") === "new" ? "new" : "full";
     try {
-      const tenantId = await resolveTenantFromAuthorize(url);
+      const { tenantId, userId } = await resolveTenantFromAuthorize(url);
       await enforceRouteRateLimit(tenantId, "notion-oauth");
 
       const notionAuthUrl = new URL("https://api.notion.com/v1/oauth/authorize");
@@ -37,7 +37,7 @@ Deno.serve(async (req: Request) => {
       notionAuthUrl.searchParams.set("response_type", "code");
       notionAuthUrl.searchParams.set("owner", "user");
       notionAuthUrl.searchParams.set("redirect_uri", REDIRECT_URI ?? "");
-      notionAuthUrl.searchParams.set("state", encodeState(tenantId, redirectOrigin, syncMode));
+      notionAuthUrl.searchParams.set("state", encodeState(tenantId, userId, redirectOrigin, syncMode));
 
       return Response.redirect(notionAuthUrl.toString(), 302);
     } catch (err) {
@@ -48,10 +48,11 @@ Deno.serve(async (req: Request) => {
   // GET /callback: Handle OAuth callback
   if (url.pathname.endsWith("/callback")) {
     let tenantId: string;
+    let userId: string;
     let redirectOrigin: string;
     let syncMode: "full" | "new";
     try {
-      ({ tenantId, redirectOrigin, syncMode } = parseTenantState(url.searchParams.get("state")));
+      ({ tenantId, userId, redirectOrigin, syncMode } = parseTenantState(url.searchParams.get("state")));
     } catch (err) {
       return authorizeErrorResponse(SOURCE, err, resolveRedirectOrigin(url));
     }
@@ -108,7 +109,7 @@ Deno.serve(async (req: Request) => {
           await sql`
             insert into public.source_connections (
               tenant_id, source, external_workspace_id, display_name, oauth_token_ref,
-              ingestion_mode, status, cursor_state, last_synced_at
+              ingestion_mode, status, cursor_state, last_synced_at, connected_by
             ) values (
               ${tenantId}::uuid,
               'notion',
@@ -118,7 +119,8 @@ Deno.serve(async (req: Request) => {
               'polling',
               'active',
               '{}'::jsonb,
-              ${lastSyncedAt}
+              ${lastSyncedAt},
+              ${userId || null}::uuid
             )
             on conflict (tenant_id, source, external_workspace_id)
             do update set
@@ -126,7 +128,8 @@ Deno.serve(async (req: Request) => {
               display_name = excluded.display_name,
               status = 'active',
               ingestion_mode = excluded.ingestion_mode,
-              last_synced_at = excluded.last_synced_at
+              last_synced_at = excluded.last_synced_at,
+              connected_by = excluded.connected_by
           `;
         });
       } catch (err) {

@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { getSupabaseClient } from './lib/supabase'
+import { PENDING_INVITE_TOKEN_KEY } from './lib/sessionKeys'
 
 export default function OAuthCallback() {
   const navigate = useNavigate()
@@ -33,6 +34,24 @@ export default function OAuthCallback() {
           if (!data.session) {
             throw new Error('Google did not return an authorization code.')
           }
+        }
+
+        // A pending team invite takes priority over normal onboarding -
+        // JoinTeam.tsx stashed the token here right before starting this
+        // sign-in. Always clear it, whether acceptance succeeds or fails,
+        // so it never resurfaces on some later, unrelated sign-in.
+        const inviteToken = sessionStorage.getItem(PENDING_INVITE_TOKEN_KEY)
+        if (inviteToken) {
+          sessionStorage.removeItem(PENDING_INVITE_TOKEN_KEY)
+          const { data: acceptData, error: acceptError } = await supabase.functions.invoke('team-invites', {
+            body: { action: 'accept', token: inviteToken },
+          })
+          if (acceptError || acceptData?.error) {
+            setMessage(acceptError?.message ?? String(acceptData?.error) ?? 'Unable to accept this invite.')
+            return
+          }
+          navigate('/dashboard', { replace: true })
+          return
         }
 
         navigate('/connect-workspaces', { replace: true })

@@ -85,7 +85,15 @@ async function exchangeForBackendSession(): Promise<BackendSession> {
 
   const response = await fetch(`${API_URL}/auth/session`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    // Region-pinned for the same reason apiFetch is - and it matters more
+    // here, because this call sits in front of every other one: no page can
+    // fetch anything until the backend token exists. Measured out of region
+    // at 2,866ms for a single one-row membership lookup that takes ~20ms in
+    // region, on every cold page load.
+    headers: {
+      'Content-Type': 'application/json',
+      'x-region': FUNCTION_REGION,
+    },
     body: JSON.stringify({ supabase_token: supabaseToken }),
   })
 
@@ -132,14 +140,37 @@ async function getBackendToken(): Promise<string> {
 /** Call this on sign-out so a stale token from the previous user can't leak into the next session. */
 export function clearBackendSession(): void {
   cachedSession = null
+  primedTenantId = null
 }
 
 /** Returns the caller's tenant_id, exchanging (or re-exchanging) a backend session as needed. */
+/**
+ * Tenant id learned from a plain memberships read, without minting a tenant
+ * JWT.
+ *
+ * Page load used to stall on a waterfall: read memberships, then exchange
+ * for a backend session purely to learn the tenant id, then read
+ * source_connections. Three sequential round trips before a single
+ * connector could render - and from Asia to the us-west-1 database each one
+ * is expensive. The middle hop was doing no work the first hop hadn't
+ * already done.
+ *
+ * Resolution deliberately matches /auth/session exactly (oldest membership
+ * first), so this can never disagree with the tenant the backend token
+ * would have carried.
+ */
+let primedTenantId: string | null = null
+
+export function primeTenantId(tenantId: string): void {
+  primedTenantId = tenantId
+}
+
 export async function getTenantId(): Promise<string> {
   assertNotDemoMode()
   if (cachedSession && cachedSession.expiresAt > Date.now()) {
     return cachedSession.tenantId
   }
+  if (primedTenantId) return primedTenantId
   if (!pendingExchange) {
     pendingExchange = exchangeForBackendSession().finally(() => {
       pendingExchange = null
@@ -169,6 +200,24 @@ export async function getTenantPlan(): Promise<string> {
  * Throws ApiError on any non-2xx response, with retryAfterSeconds populated
  * for 429s (see the Retry-After header /search and /digest send).
  */
+/**
+ * Region the Edge Functions must execute in.
+ *
+ * Measured, not guessed: Edge Functions default to running near the USER,
+ * while the database lives in us-west-1. Every database round trip was
+ * therefore crossing the Pacific at ~250ms, and one withTenant() call costs
+ * four of them (BEGIN, set_config, the query, COMMIT). The same diagnostic
+ * run twice, differing only by this header, measured 7,422ms vs 133ms - a
+ * 56x difference on identical work.
+ *
+ * Paying one long trip to reach the function beats the function making
+ * fifteen long trips to reach the database. This also shortens the hops to
+ * Anthropic and Voyage, which are US-hosted too.
+ *
+ * Keep this in sync with the database region if the project ever moves.
+ */
+const FUNCTION_REGION = 'us-west-1'
+
 export async function apiFetch<T>(path: string, options: RequestInit = {}): Promise<T> {
   const token = await getBackendToken()
 
@@ -177,6 +226,7 @@ export async function apiFetch<T>(path: string, options: RequestInit = {}): Prom
     headers: {
       'Content-Type': 'application/json',
       Authorization: `Bearer ${token}`,
+      'x-region': FUNCTION_REGION,
       ...options.headers,
     },
   })
@@ -313,6 +363,100 @@ export function searchDecisions(question: string): Promise<SearchResponse> {
     method: 'POST',
     body: JSON.stringify({ question }),
   })
+}
+
+/**
+ * Streaming search. Same endpoint and same result as searchDecisions, but
+ * onDelta fires with each slice of the answer as Claude writes it.
+ *
+ * Why: the synthesis call measures ~4.9s, and the user previously watched a
+ * blank panel for all of it. Total time is unchanged - this only makes the
+ * wait legible.
+ *
+ * Falls back to the plain JSON path on any transport problem, so a proxy
+ * that buffers or strips event-streams degrades to today's behaviour rather
+ * than breaking search outright.
+ */
+export async function searchDecisionsStreaming(
+  question: string,
+  onDelta: (chunk: string) => void,
+): Promise<SearchResponse> {
+  const token = await getBackendToken()
+
+  let response: Response
+  try {
+    response = await fetch(`${API_URL}/search`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${token}`,
+        'x-region': FUNCTION_REGION,
+        Accept: 'text/event-stream',
+      },
+      body: JSON.stringify({ question, stream: true }),
+    })
+  } catch {
+    return searchDecisions(question)
+  }
+
+  if (!response.ok) {
+    let detail = `Request failed (${response.status})`
+    try {
+      const body = (await response.json()) as { detail?: string }
+      if (body.detail) detail = body.detail
+    } catch {
+      // Non-JSON error body, keep the generic message.
+    }
+    if (response.status === 429) {
+      const retryAfterSeconds = Number(response.headers.get('Retry-After') ?? '0')
+      throw new ApiError(detail, 429, retryAfterSeconds)
+    }
+    throw new ApiError(detail, response.status)
+  }
+
+  // Server answered without a stream (older deploy, or an intermediary that
+  // rewrote the content type) - read it as the plain JSON it is.
+  if (!response.body || !response.headers.get('Content-Type')?.includes('text/event-stream')) {
+    return (await response.json()) as SearchResponse
+  }
+
+  const reader = response.body.getReader()
+  const decoder = new TextDecoder()
+  let buffer = ''
+  let final: SearchResponse | null = null
+  let streamError: string | null = null
+
+  while (true) {
+    const { done, value } = await reader.read()
+    if (done) break
+    buffer += decoder.decode(value, { stream: true })
+
+    // Frames are blank-line separated and can straddle chunks; keep the tail.
+    const frames = buffer.split('\n\n')
+    buffer = frames.pop() ?? ''
+
+    for (const frame of frames) {
+      let event = 'message'
+      let data = ''
+      for (const line of frame.split('\n')) {
+        if (line.startsWith('event:')) event = line.slice(6).trim()
+        else if (line.startsWith('data:')) data += line.slice(5).trim()
+      }
+      if (!data) continue
+      try {
+        const parsed = JSON.parse(data)
+        if (event === 'delta' && typeof parsed.text === 'string') onDelta(parsed.text)
+        else if (event === 'done') final = parsed as SearchResponse
+        else if (event === 'error') streamError = String(parsed.error ?? 'Search failed')
+      } catch {
+        // Skip an unparseable frame rather than failing the whole search.
+      }
+    }
+  }
+
+  if (streamError) throw new ApiError(streamError, 502)
+  if (!final) throw new ApiError('Search ended before an answer arrived.', 502)
+  return final
 }
 
 export function listDecisions(

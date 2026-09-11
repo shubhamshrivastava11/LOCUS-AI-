@@ -152,6 +152,9 @@ Deno.serve(async (_req) => {
               actor_display_name: issue.user?.login,
               thread_ref: `${repo.full_name}#${issue.number}`,
               permission_scope: [],
+              // Build Memory's toggle key for this source (see
+              // capture_item_id in _shared/queue.ts).
+              capture_item_id: repo.full_name,
               known_actors: knownActorsFor(issue.user),
               raw_content: {
                 subject: `${repo.full_name} #${issue.number}: ${kind} - ${issue.title ?? ""}`,
@@ -190,6 +193,9 @@ Deno.serve(async (_req) => {
               actor_display_name: comment.user?.login,
               thread_ref: `${repo.full_name}#${issueNumber}`,
               permission_scope: [],
+              // Build Memory's toggle key for this source (see
+              // capture_item_id in _shared/queue.ts).
+              capture_item_id: repo.full_name,
               known_actors: knownActorsFor(comment.user),
               raw_content: {
                 subject: `${repo.full_name} #${issueNumber}`,

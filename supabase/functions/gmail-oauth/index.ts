@@ -29,7 +29,7 @@ Deno.serve(async (req: Request) => {
     const redirectOrigin = resolveRedirectOrigin(url);
     const syncMode = url.searchParams.get("sync_mode") === "new" ? "new" : "full";
     try {
-      const tenantId = await resolveTenantFromAuthorize(url);
+      const { tenantId, userId } = await resolveTenantFromAuthorize(url);
       // Same "expensive route" guard /search and /digest already use -
       // bounds how many times a tenant can INITIATE a connect flow (20 /
       // 5 min), not how many times Gmail's own API gets called during
@@ -52,7 +52,7 @@ Deno.serve(async (req: Request) => {
       googleAuthUrl.searchParams.set("scope", scopes.join(" "));
       googleAuthUrl.searchParams.set("access_type", "offline");
       googleAuthUrl.searchParams.set("prompt", "consent");
-      googleAuthUrl.searchParams.set("state", encodeState(tenantId, redirectOrigin, syncMode));
+      googleAuthUrl.searchParams.set("state", encodeState(tenantId, userId, redirectOrigin, syncMode));
 
       return Response.redirect(googleAuthUrl.toString(), 302);
     } catch (err) {
@@ -63,10 +63,11 @@ Deno.serve(async (req: Request) => {
   // GET /callback: handle Google's redirect back
   if (url.pathname.endsWith("/callback")) {
     let tenantId: string;
+    let userId: string;
     let redirectOrigin: string;
     let syncMode: "full" | "new";
     try {
-      ({ tenantId, redirectOrigin, syncMode } = parseTenantState(url.searchParams.get("state")));
+      ({ tenantId, userId, redirectOrigin, syncMode } = parseTenantState(url.searchParams.get("state")));
     } catch (err) {
       return authorizeErrorResponse(SOURCE, err, resolveRedirectOrigin(url));
     }
@@ -135,7 +136,7 @@ Deno.serve(async (req: Request) => {
           await sql`
             insert into public.source_connections (
               tenant_id, source, external_workspace_id, display_name, oauth_token_ref,
-              ingestion_mode, status, cursor_state, last_synced_at
+              ingestion_mode, status, cursor_state, last_synced_at, connected_by
             ) values (
               ${tenantId}::uuid,
               'gmail',
@@ -148,7 +149,8 @@ Deno.serve(async (req: Request) => {
                 history_id: null,
                 refresh_token: tokenData.refresh_token ?? null,
               })}::jsonb,
-              ${lastSyncedAt}
+              ${lastSyncedAt},
+              ${userId || null}::uuid
             )
             on conflict (tenant_id, source, external_workspace_id)
             do update set
@@ -157,7 +159,8 @@ Deno.serve(async (req: Request) => {
               status = 'active',
               cursor_state = excluded.cursor_state,
               ingestion_mode = excluded.ingestion_mode,
-              last_synced_at = excluded.last_synced_at
+              last_synced_at = excluded.last_synced_at,
+              connected_by = excluded.connected_by
           `;
         });
       } catch (err) {

@@ -18,7 +18,7 @@ import { decryptToken } from "../_shared/tokenCrypto.ts";
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
-  "Access-Control-Allow-Headers": "authorization, content-type, apikey",
+  "Access-Control-Allow-Headers": "authorization, content-type, apikey, x-region",
   "Access-Control-Allow-Methods": "GET, OPTIONS",
 };
 

@@ -172,6 +172,8 @@ Deno.serve(async (req: Request) => {
       // unthreaded message only ever groups with its own real replies.
       thread_ref: String(event.thread_ts ?? event.ts ?? ""),
       permission_scope: event.channel ? [String(event.channel)] : [],
+      // Same channel id Build Memory lists and stores its toggle against.
+      capture_item_id: event.channel ? String(event.channel) : undefined,
       raw_content: { text: String(event.text ?? "") },
       source_permalink: slackDeepLink,
       received_at: receivedAt,

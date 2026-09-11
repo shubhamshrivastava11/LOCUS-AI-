@@ -49,7 +49,25 @@ export async function getCurrentTenant(req: Request): Promise<TenantContext> {
  * for the new layer, and what the separate live-isDecisionAccessible
  * retrofit closes for this one, once real membership data exists.
  */
-export async function resolvePermissionScopes(userId: string, tenantId: string): Promise<string[]> {
+/**
+ * Sources that belong to ONE PERSON, not to the workspace.
+ *
+ * Slack, Notion, Jira, Teams and the rest are shared org resources: every
+ * member of the workspace is expected to see them. A Gmail mailbox is not -
+ * it is somebody's private correspondence, and the fact that they connected
+ * it to a team workspace does not make it team property.
+ *
+ * Confirmed live before this existed: source_connections.external_workspace_id
+ * for Gmail is literally the email address, and the query below handed every
+ * member of a tenant every active connection's workspace id regardless of who
+ * connected it. On a team plan that made one person's inbox readable by the
+ * whole team.
+ */
+export const PERSONAL_SOURCES = ["gmail"] as const;
+
+export async function resolvePermissionScopes(
+  userId: string, tenantId: string,
+): Promise<{ scopes: string[]; email: string | null }> {
   // Two separate connections (admin pool vs tenant pool) - genuinely
   // independent, safe to run concurrently rather than paying both
   // round-trip latencies back to back.
@@ -62,6 +80,17 @@ export async function resolvePermissionScopes(userId: string, tenantId: string):
       const rows = await sql`
         SELECT DISTINCT external_workspace_id FROM public.source_connections
         WHERE tenant_id = ${tenantId} AND status = 'active' AND external_workspace_id IS NOT NULL
+          AND (
+            source <> ALL(${[...PERSONAL_SOURCES]}::text[])
+            -- Rows predating connected_by cannot be attributed to anyone.
+            -- Left visible deliberately: excluding them would hide their
+            -- own owner's mail from them, which is a worse failure than
+            -- the leak it would prevent. Confirmed against live data that
+            -- every such row today sits in a single-member tenant, so this
+            -- carve-out currently exposes nothing.
+            OR connected_by IS NULL
+            OR connected_by = ${userId}::uuid
+          )
       `;
       return rows.map((r) => r.external_workspace_id as string);
     }),
@@ -69,5 +98,8 @@ export async function resolvePermissionScopes(userId: string, tenantId: string):
 
   const scopes = new Set<string>(connectedScopes);
   if (email) scopes.add(email);
-  return [...scopes];
+  // Email returned alongside, not just folded into the set: the caller's
+  // own address is the identifier source_scope_members matches on, and
+  // there's no way to pick it back out of the flattened scope list.
+  return { scopes: [...scopes], email };
 }

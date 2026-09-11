@@ -14,11 +14,13 @@ import LandingPage from '../landing-page/LandingPage'
 import WelcomePage from '../landing-page/WelcomePage'
 import HowItWorks from '../landing-page/HowItWorks'
 import ConnectWorkspaces from './ConnectWorkspaces'
+import JoinTeam from './JoinTeam'
 import OAuthCallback from './OAuthCallback'
 import SourceOAuthCallback from './SourceOAuthCallback'
 import { getSupabaseClient, isSupabaseConfigured } from './lib/supabase'
 import { EARLY_ACCESS_WAITLIST_FORM_URL } from './lib/appUrl'
 import { rememberAccountFromSession } from './lib/accountRegistry'
+import { primeTenantId } from './lib/api'
 import { DEMO_EMAIL_KEY, WORKSPACES_DONE_KEY } from './lib/sessionKeys'
 import { fetchSourceConnections } from './lib/sourceConnections'
 import DecisionReady from './DecisionReady'
@@ -39,12 +41,21 @@ function HowItWorksMarketing() {
 function useAuthEmail() {
   const [userEmail, setUserEmail] = useState<string | null>(null)
   const [authReady, setAuthReady] = useState(false)
-  // null = not yet checked. Early access is gated server-side (the
-  // on_auth_user_created trigger only provisions a tenant for allowlisted
-  // emails - see supabase/migrations/20260812000000_early_access_allowlist.sql),
-  // so a signed-in user with zero memberships rows means "authenticated but
-  // not yet granted access", not a broken account.
+  // null = not yet checked. A signed-in user with zero memberships rows
+  // means "authenticated but hasn't got a workspace yet" - could be
+  // because they're not on the early access list (see isEligible below),
+  // or because they ARE eligible and just haven't chosen "start a new
+  // workspace" / "join with a code" yet on ChooseWorkspaceScreen. Those
+  // two cases used to be indistinguishable (both just showed
+  // WaitlistScreen) - isEligible is the signal that tells them apart.
   const [hasTenant, setHasTenant] = useState<boolean | null>(null)
+  // null = not yet checked. Real, frontend-checkable table
+  // (early_access_allowlist, RLS-scoped to the caller's own email) - see
+  // supabase/migrations/20260904020000_real_allowlist_table_and_choice_flow.sql.
+  // Replaced the old on_auth_user_created trigger, which used to decide
+  // this the same instant it silently auto-created a tenant, with no
+  // chance for the frontend to ask the user anything first.
+  const [isEligible, setIsEligible] = useState<boolean | null>(null)
   // null = not yet checked. Backed by the signed-in user's own
   // user_metadata.terms_version (set by TermsGateModal on accept), so it
   // travels with the account across devices/sessions rather than living in
@@ -52,11 +63,38 @@ function useAuthEmail() {
   // is ever bumped for a material terms change.
   const [hasAcceptedTerms, setHasAcceptedTerms] = useState<boolean | null>(null)
 
+  const applySession = async (session: Session | null) => {
+    const supabase = getSupabaseClient()
+    setUserEmail(session?.user.email ?? null)
+    if (!session) {
+      setHasTenant(null)
+      setIsEligible(null)
+      setHasAcceptedTerms(null)
+      setAuthReady(true)
+      return
+    }
+    rememberAccountFromSession(session)
+    setHasAcceptedTerms(session.user.user_metadata?.terms_version === TERMS_VERSION)
+    const [membershipResult, allowlistResult] = await Promise.all([
+      // Ordered to match /auth/session's own oldest-membership resolution,
+      // so the id primed below is always the same tenant the backend token
+      // would carry.
+      supabase.from('memberships').select('tenant_id').order('created_at', { ascending: true }).limit(1),
+      supabase.from('early_access_allowlist').select('email').limit(1),
+    ])
+    const membershipTenantId = membershipResult.data?.[0]?.tenant_id
+    if (membershipTenantId) primeTenantId(membershipTenantId)
+    setHasTenant(!membershipResult.error && (membershipResult.data?.length ?? 0) > 0)
+    setIsEligible(!allowlistResult.error && (allowlistResult.data?.length ?? 0) > 0)
+    setAuthReady(true)
+  }
+
   useEffect(() => {
     const demoEmail = sessionStorage.getItem(DEMO_EMAIL_KEY)
     if (demoEmail) {
       setUserEmail(demoEmail)
       setHasTenant(true)
+      setIsEligible(true)
       setHasAcceptedTerms(true)
       setAuthReady(true)
       return
@@ -64,27 +102,13 @@ function useAuthEmail() {
 
     if (!isSupabaseConfigured()) {
       setHasTenant(true)
+      setIsEligible(true)
       setHasAcceptedTerms(true)
       setAuthReady(true)
       return
     }
 
     const supabase = getSupabaseClient()
-
-    const applySession = async (session: Session | null) => {
-      setUserEmail(session?.user.email ?? null)
-      if (!session) {
-        setHasTenant(null)
-        setHasAcceptedTerms(null)
-        setAuthReady(true)
-        return
-      }
-      rememberAccountFromSession(session)
-      setHasAcceptedTerms(session.user.user_metadata?.terms_version === TERMS_VERSION)
-      const { data, error } = await supabase.from('memberships').select('tenant_id').limit(1)
-      setHasTenant(!error && (data?.length ?? 0) > 0)
-      setAuthReady(true)
-    }
 
     void supabase.auth.getSession().then(({ data }) => void applySession(data.session))
 
@@ -95,7 +119,19 @@ function useAuthEmail() {
     return () => data.subscription.unsubscribe()
   }, [])
 
-  return { userEmail, authReady, hasTenant, hasAcceptedTerms, markTermsAccepted: () => setHasAcceptedTerms(true) }
+  // Lets ChooseWorkspaceScreen re-check membership right after creating or
+  // joining a workspace, instead of waiting on the next auth state change
+  // (there isn't one - the session doesn't change, only the tenant does).
+  const recheckWorkspace = async () => {
+    const { data } = await getSupabaseClient().auth.getSession()
+    await applySession(data.session)
+  }
+
+  return {
+    userEmail, authReady, hasTenant, isEligible, hasAcceptedTerms,
+    markTermsAccepted: () => setHasAcceptedTerms(true),
+    recheckWorkspace,
+  }
 }
 
 /** Shown to a real (non-demo) account that authenticated successfully but
@@ -134,6 +170,123 @@ function WaitlistScreen({ email }: { email: string }) {
       >
         Log out
       </button>
+    </main>
+  )
+}
+
+/**
+ * Shown to a real account that's on the early access allowlist but hasn't
+ * got a workspace yet - the choice handle_new_user() used to make
+ * silently and unconditionally (always "start a solo workspace", with no
+ * way to say "actually, add me to my team's existing one instead") before
+ * this screen existed. See team-invites/index.ts's create_workspace and
+ * accept actions - both real, already-authenticated endpoints, just
+ * called from a new place.
+ */
+function ChooseWorkspaceScreen({ email, onDone }: { email: string; onDone: () => void }) {
+  // Which button is mid-request, if any - null when neither is. Two real,
+  // separately-created tenant plans, not just cosmetic labels: 'self_serve'
+  // (individual) genuinely can never invite anyone, enforced server-side in
+  // team-invites' create action, not just hidden UI - see TeamSettings'
+  // own workspace_plan check. Nothing upgrades one plan into the other
+  // later in this pass.
+  const [creatingPlan, setCreatingPlan] = useState<'self_serve' | 'team' | null>(null)
+  const [createError, setCreateError] = useState('')
+  const [inviteCode, setInviteCode] = useState('')
+  const [isJoining, setIsJoining] = useState(false)
+  const [joinError, setJoinError] = useState('')
+
+  const handleCreate = async (plan: 'self_serve' | 'team') => {
+    setCreatingPlan(plan)
+    setCreateError('')
+    const { data, error } = await getSupabaseClient().functions.invoke('team-invites', {
+      body: { action: 'create_workspace', plan },
+    })
+    if (error || data?.error) {
+      setCreateError(error?.message ?? String(data?.error) ?? 'Unable to create workspace.')
+      setCreatingPlan(null)
+      return
+    }
+    onDone()
+  }
+
+  const handleJoin = async () => {
+    if (!inviteCode.trim()) {
+      setJoinError('Paste the invite code you were given.')
+      return
+    }
+    setIsJoining(true)
+    setJoinError('')
+    const { data, error } = await getSupabaseClient().functions.invoke('team-invites', {
+      body: { action: 'accept', token: inviteCode.trim() },
+    })
+    if (error || data?.error) {
+      setJoinError(error?.message ?? String(data?.error) ?? 'Unable to join with this code.')
+      setIsJoining(false)
+      return
+    }
+    onDone()
+  }
+
+  return (
+    <main className="flex min-h-screen flex-col items-center justify-center gap-8 bg-white px-6 py-10 text-center">
+      <div>
+        <h1 className="text-[20px] font-bold text-[#111827]">Welcome to Locus AI</h1>
+        <p className="mt-1 text-[14px] text-[#6B7280]">Signed in as {email}. How do you want to get started?</p>
+      </div>
+
+      {createError ? (
+        <p role="alert" className="max-w-[380px] text-[13px] text-[#B4232C]">{createError}</p>
+      ) : null}
+
+      <div className="grid w-full max-w-[820px] gap-5 sm:grid-cols-2">
+        <div className="rounded-xl border border-[#DEE1E8] p-5 text-left">
+          <h2 className="text-[15px] font-semibold text-[#111827]">Individual account</h2>
+          <p className="mt-1 text-[13px] text-[#6B7280]">Just for you. This workspace stays yours alone - it can never invite anyone else into it.</p>
+          <button
+            type="button"
+            onClick={() => void handleCreate('self_serve')}
+            disabled={creatingPlan !== null}
+            className="mt-3 w-full rounded-full border border-[#4B3BD4] px-5 py-2 text-[14px] font-semibold text-[#4B3BD4] transition-colors hover:bg-[#F8F7FF] disabled:cursor-wait disabled:opacity-70"
+          >
+            {creatingPlan === 'self_serve' ? 'Creating...' : 'Continue on my own'}
+          </button>
+        </div>
+
+        <div className="rounded-xl border border-[#DEE1E8] p-5 text-left">
+          <h2 className="text-[15px] font-semibold text-[#111827]">Team account</h2>
+          <p className="mt-1 text-[13px] text-[#6B7280]">You're the owner. Invite teammates into this workspace anytime from Settings, and everyone shares the same memory.</p>
+          <button
+            type="button"
+            onClick={() => void handleCreate('team')}
+            disabled={creatingPlan !== null}
+            className="mt-3 w-full rounded-full bg-[#4B3BD4] px-5 py-2 text-[14px] font-semibold text-white transition-colors hover:bg-[#3F30BC] disabled:cursor-wait disabled:opacity-70"
+          >
+            {creatingPlan === 'team' ? 'Creating...' : 'Create a team account'}
+          </button>
+        </div>
+      </div>
+
+      <div className="w-full max-w-[380px] rounded-xl border border-[#DEE1E8] p-5 text-left">
+        <h2 className="text-[15px] font-semibold text-[#111827]">Join your team's workspace</h2>
+        <p className="mt-1 text-[13px] text-[#6B7280]">Already have teammates using Locus AI? Paste the invite code they sent you to join their shared workspace instead.</p>
+        <input
+          type="text"
+          value={inviteCode}
+          onChange={(event) => setInviteCode(event.target.value)}
+          placeholder="Invite code"
+          className="mt-3 w-full rounded-lg border border-[#DEE1E8] px-3 py-2 text-[14px] text-[#111827] outline-none focus:border-[#5A45FF]"
+        />
+        {joinError ? <p role="alert" className="mt-2 text-[13px] text-[#B4232C]">{joinError}</p> : null}
+        <button
+          type="button"
+          onClick={() => void handleJoin()}
+          disabled={isJoining}
+          className="mt-3 w-full rounded-full border border-[#4B3BD4] px-5 py-2 text-[14px] font-semibold text-[#4B3BD4] transition-colors hover:bg-[#F8F7FF] disabled:cursor-wait disabled:opacity-70"
+        >
+          {isJoining ? 'Joining...' : 'Join workspace'}
+        </button>
+      </div>
     </main>
   )
 }
@@ -204,7 +357,7 @@ function useWorkspacesConnected(userEmail: string | null, authReady: boolean) {
  * demo-or-Supabase-session check every other protected route already uses.
  */
 function RequireAuth() {
-  const { userEmail, authReady, hasTenant, hasAcceptedTerms, markTermsAccepted } = useAuthEmail()
+  const { userEmail, authReady, hasTenant, isEligible, hasAcceptedTerms, markTermsAccepted, recheckWorkspace } = useAuthEmail()
 
   if (!authReady) {
     return (
@@ -225,6 +378,10 @@ function RequireAuth() {
     return <Navigate to="/" replace />
   }
 
+  if (hasTenant === false && isEligible === true) {
+    return <ChooseWorkspaceScreen email={userEmail} onDone={() => void recheckWorkspace()} />
+  }
+
   if (hasTenant === false) {
     return <WaitlistScreen email={userEmail} />
   }
@@ -238,7 +395,7 @@ function RequireAuth() {
 
 function ConnectWorkspacesRoute() {
   const navigate = useNavigate()
-  const { userEmail, authReady, hasTenant, hasAcceptedTerms, markTermsAccepted } = useAuthEmail()
+  const { userEmail, authReady, hasTenant, isEligible, hasAcceptedTerms, markTermsAccepted, recheckWorkspace } = useAuthEmail()
   const { workspacesConnected, markConnected, checked } = useWorkspacesConnected(userEmail, authReady)
 
   if (!authReady || (userEmail && !checked)) {
@@ -258,6 +415,10 @@ function ConnectWorkspacesRoute() {
     // logged-out visitor at "/" - not the bare "/welcome" sign-in screen,
     // which is where this race was actually ending up.
     return <Navigate to="/" replace />
+  }
+
+  if (hasTenant === false && isEligible === true) {
+    return <ChooseWorkspaceScreen email={userEmail} onDone={() => void recheckWorkspace()} />
   }
 
   if (hasTenant === false) {
@@ -284,7 +445,7 @@ function ConnectWorkspacesRoute() {
 function AuthRoutes() {
   const navigate = useNavigate()
   const [searchParams] = useSearchParams()
-  const { userEmail, authReady, hasTenant, hasAcceptedTerms, markTermsAccepted } = useAuthEmail()
+  const { userEmail, authReady, hasTenant, isEligible, hasAcceptedTerms, markTermsAccepted, recheckWorkspace } = useAuthEmail()
   const { workspacesConnected, checked } = useWorkspacesConnected(userEmail, authReady)
 
   const isOAuthCallback =
@@ -302,6 +463,10 @@ function AuthRoutes() {
         Loading…
       </main>
     )
+  }
+
+  if (userEmail && hasTenant === false && isEligible === true) {
+    return <ChooseWorkspaceScreen email={userEmail} onDone={() => void recheckWorkspace()} />
   }
 
   if (userEmail && hasTenant === false) {
@@ -337,6 +502,7 @@ function AuthRoutes() {
 const PAGE_TITLES: Record<string, string> = {
   '/welcome': 'Welcome · Locus AI',
   '/connect-workspaces': 'Connect Your Tools · Locus AI',
+  '/join': 'Join Your Team · Locus AI',
   '/how-it-works': 'How It Works · Locus AI',
   '/dashboard': 'Dashboard · Locus AI',
   '/decision-log': 'Memory Explorer · Locus AI',
@@ -362,6 +528,7 @@ function App() {
         <Route path="/" element={<AuthRoutes />} />
         <Route path="/welcome" element={<WelcomePage />} />
         <Route path="/connect-workspaces" element={<ConnectWorkspacesRoute />} />
+        <Route path="/join" element={<JoinTeam />} />
 
         {/* Full 3-section landing (Get Started + How it works + Why Locus) */}
         <Route path="/how-it-works" element={<HowItWorksMarketing />} />

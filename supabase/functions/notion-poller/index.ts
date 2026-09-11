@@ -76,6 +76,9 @@ Deno.serve(async (_req) => {
           actor: page.last_edited_by?.id || "unknown",
           thread_ref: page.id,
           permission_scope: source.external_workspace_id ? [String(source.external_workspace_id)] : [],
+          // Build Memory lists Notion pages by page id, which is what the
+          // toggle is stored against - not the workspace id above.
+          capture_item_id: String(page.id),
           raw_content: page,
           // Notion's Search API already returns the page's real URL - no
           // extra lookup needed, unlike Slack/Gmail.

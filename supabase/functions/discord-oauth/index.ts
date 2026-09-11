@@ -52,7 +52,7 @@ Deno.serve(async (req: Request) => {
   if (url.pathname.endsWith("/authorize")) {
     const redirectOrigin = resolveRedirectOrigin(url);
     try {
-      const tenantId = await resolveTenantFromAuthorize(url);
+      const { tenantId, userId } = await resolveTenantFromAuthorize(url);
       await enforceRouteRateLimit(tenantId, "discord-oauth");
 
       const authorizeUrl = new URL("https://discord.com/oauth2/authorize");
@@ -61,7 +61,7 @@ Deno.serve(async (req: Request) => {
       authorizeUrl.searchParams.set("permissions", BOT_PERMISSIONS);
       authorizeUrl.searchParams.set("redirect_uri", REDIRECT_URI ?? "");
       authorizeUrl.searchParams.set("response_type", "code");
-      authorizeUrl.searchParams.set("state", encodeState(tenantId, redirectOrigin));
+      authorizeUrl.searchParams.set("state", encodeState(tenantId, userId, redirectOrigin));
 
       return Response.redirect(authorizeUrl.toString(), 302);
     } catch (err) {
@@ -71,9 +71,10 @@ Deno.serve(async (req: Request) => {
 
   if (url.pathname.endsWith("/callback")) {
     let tenantId: string;
+    let userId: string;
     let redirectOrigin: string;
     try {
-      ({ tenantId, redirectOrigin } = parseTenantState(url.searchParams.get("state")));
+      ({ tenantId, userId, redirectOrigin } = parseTenantState(url.searchParams.get("state")));
     } catch (err) {
       return authorizeErrorResponse(SOURCE, err, resolveRedirectOrigin(url));
     }
@@ -114,7 +115,7 @@ Deno.serve(async (req: Request) => {
         await sql`
           insert into public.source_connections (
             tenant_id, source, external_workspace_id, display_name, oauth_token_ref,
-            ingestion_mode, status, cursor_state, last_synced_at
+            ingestion_mode, status, cursor_state, last_synced_at, connected_by
           ) values (
             ${tenantId}::uuid,
             'discord',
@@ -124,12 +125,14 @@ Deno.serve(async (req: Request) => {
             'polling',
             'active',
             '{}'::jsonb,
-            null
+            null,
+            ${userId || null}::uuid
           )
           on conflict (tenant_id, source, external_workspace_id)
           do update set
             display_name = excluded.display_name,
-            status = 'active'
+            status = 'active',
+            connected_by = excluded.connected_by
         `;
       });
 

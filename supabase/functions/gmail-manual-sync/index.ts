@@ -406,6 +406,12 @@ Deno.serve(async (_req) => {
           actor_display_name: actorDisplayName,
           thread_ref: rawMsg.threadId,
           permission_scope: source.external_workspace_id ? [String(source.external_workspace_id)] : [],
+          // Build Memory lists Gmail by label, and a message carries every
+          // label applied to it - not the account id in permission_scope
+          // above. Gmail returns labelIds on every messages.get.
+          capture_item_id: Array.isArray(rawMsg.labelIds) && rawMsg.labelIds.length > 0
+            ? (rawMsg.labelIds as string[])
+            : undefined,
           likely_bulk_mail: likelyBulkMail,
           raw_content: {
             subject: getHeader("Subject"),

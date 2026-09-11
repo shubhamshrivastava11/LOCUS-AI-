@@ -65,13 +65,13 @@ Deno.serve(async (req: Request) => {
   if (url.pathname.endsWith("/authorize")) {
     const redirectOrigin = resolveRedirectOrigin(url);
     try {
-      const tenantId = await resolveTenantFromAuthorize(url);
+      const { tenantId, userId } = await resolveTenantFromAuthorize(url);
       await enforceRouteRateLimit(tenantId, "github-oauth");
 
       const authorizeUrl = new URL("https://github.com/login/oauth/authorize");
       authorizeUrl.searchParams.set("client_id", CLIENT_ID ?? "");
       authorizeUrl.searchParams.set("redirect_uri", REDIRECT_URI ?? "");
-      authorizeUrl.searchParams.set("state", encodeState(tenantId, redirectOrigin));
+      authorizeUrl.searchParams.set("state", encodeState(tenantId, userId, redirectOrigin));
 
       return Response.redirect(authorizeUrl.toString(), 302);
     } catch (err) {
@@ -83,9 +83,10 @@ Deno.serve(async (req: Request) => {
   // the installation(s) that user can see, persist the installation_id.
   if (url.pathname.endsWith("/callback")) {
     let tenantId: string;
+    let userId: string;
     let redirectOrigin: string;
     try {
-      ({ tenantId, redirectOrigin } = parseTenantState(url.searchParams.get("state")));
+      ({ tenantId, userId, redirectOrigin } = parseTenantState(url.searchParams.get("state")));
     } catch (err) {
       return authorizeErrorResponse(SOURCE, err, resolveRedirectOrigin(url));
     }
@@ -155,7 +156,7 @@ Deno.serve(async (req: Request) => {
         await sql`
           insert into public.source_connections (
             tenant_id, source, external_workspace_id, display_name, oauth_token_ref,
-            ingestion_mode, status, cursor_state, last_synced_at
+            ingestion_mode, status, cursor_state, last_synced_at, connected_by
           ) values (
             ${tenantId}::uuid,
             'github',
@@ -165,13 +166,15 @@ Deno.serve(async (req: Request) => {
             'polling',
             'active',
             ${sql.json({ installation_id: installation.id })},
-            null
+            null,
+            ${userId || null}::uuid
           )
           on conflict (tenant_id, source, external_workspace_id)
           do update set
             display_name = excluded.display_name,
             status = 'active',
-            cursor_state = excluded.cursor_state
+            cursor_state = excluded.cursor_state,
+            connected_by = excluded.connected_by
         `;
       });
 

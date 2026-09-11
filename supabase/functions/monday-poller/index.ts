@@ -204,6 +204,9 @@ Deno.serve(async (_req) => {
               actor_display_name: item.creator?.name,
               thread_ref: `${board.id}/${item.id}`,
               permission_scope: [],
+              // Build Memory's toggle key for this source (see
+              // capture_item_id in _shared/queue.ts).
+              capture_item_id: String(board.id),
               known_actors: knownActorsFor(item.creator),
               raw_content: {
                 subject: `${board.name ?? "Board"}: ${item.name ?? ""}`,
@@ -231,6 +234,9 @@ Deno.serve(async (_req) => {
               actor_display_name: update.creator?.name,
               thread_ref: `${board.id}/${item.id}`,
               permission_scope: [],
+              // Build Memory's toggle key for this source (see
+              // capture_item_id in _shared/queue.ts).
+              capture_item_id: String(board.id),
               known_actors: knownActorsFor(update.creator),
               raw_content: {
                 subject: `${board.name ?? "Board"}: ${item.name ?? ""}`,

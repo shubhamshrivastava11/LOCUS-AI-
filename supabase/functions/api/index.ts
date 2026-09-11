@@ -30,11 +30,13 @@ import { decryptToken } from "../_shared/tokenCrypto.ts";
 import { enforceUserPromptLimit, PromptLimitExceededError } from "../_shared/userLimits.ts";
 import { enforceRouteRateLimit, RouteRateLimitExceededError } from "../_shared/routeRateLimit.ts";
 import * as jose from "npm:jose@5";
-import { getCurrentTenant, resolvePermissionScopes, type TenantContext } from "../_shared/tenantAuth.ts";
+import { getCurrentTenant, PERSONAL_SOURCES, resolvePermissionScopes, type TenantContext } from "../_shared/tenantAuth.ts";
+import { Trace } from "../_shared/trace.ts";
+import { parseAsOf } from "../_shared/temporal.ts";
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
-  "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type",
+  "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type, x-region",
   "Access-Control-Allow-Methods": "GET, POST, PATCH, OPTIONS",
 };
 
@@ -558,6 +560,10 @@ async function signTenantJwt(userId: string, tenantId: string, role: string): Pr
 
 // ── Handler: POST /auth/session ────────────────────────────────────────
 async function handleAuthSession(req: Request): Promise<Response> {
+  // Traced because this sits on the critical path of every page load: the
+  // browser cannot show anything tenant-scoped until it has exchanged for a
+  // tenant token, so its cost is felt on every refresh.
+  const authTrace = new Trace();
   let body: { supabase_token?: string };
   try {
     body = await req.json();
@@ -590,10 +596,14 @@ async function handleAuthSession(req: Request): Promise<Response> {
     );
   }
 
+  authTrace.mark("load_membership");
+
   const tenantId = membership.tenant_id as string;
   const role = membership.role as string;
   const plan = membership.plan as string;
   const token = await signTenantJwt(authUserId, tenantId, role);
+  authTrace.mark("sign_jwt");
+  void authTrace.write(tenantId, "POST /auth/session");
 
   return jsonResponse({ token, tenant_id: tenantId, role, plan, expires_in: TENANT_JWT_TTL_SECONDS });
 }
@@ -632,17 +642,52 @@ function buildDecisionOut(row: any, actors: unknown[], sourceLinks: string[], so
     source_platforms: sourcePlatforms,
     created_at: row.created_at,
     updated_at: row.updated_at,
+    // Temporal memory model: valid_until null means this is current.
+    valid_from: row.valid_from ?? row.created_at,
+    valid_until: row.valid_until ?? null,
   };
 }
 
 async function listDecisions(
   tenantId: string,
+  userId: string,
   limit: number,
   offset: number,
   recordType?: string | null,
   source?: string | null,
+  asOf?: string | null,
 ) {
   return await withTenant(tenantId, async (sql) => {
+    // Temporal memory model (see the 20260909100000 migration). Without
+    // as_of this is the live view: only memories that are still true.
+    // With as_of it reconstructs what the organization believed at that
+    // moment - a memory that has since been superseded reappears, because
+    // back then it had not been. Costs nothing but a WHERE clause; there
+    // is no model call anywhere on this path.
+    const temporalFilter = asOf
+      ? sql`AND d.valid_from <= ${asOf}::timestamptz
+            AND (d.valid_until IS NULL OR d.valid_until > ${asOf}::timestamptz)`
+      : sql`AND d.superseded_by IS NULL`;
+    // Memory Explorer and the Decision Log filtered on tenant_id alone, so
+    // a decision extracted from one member's personal mailbox was listed
+    // for the whole team - regardless of the scope checks /search applies,
+    // which this path never ran at all. Excludes decisions whose origin
+    // connection is a PERSONAL_SOURCES connection owned by somebody else;
+    // unattributed legacy rows stay visible, same reasoning as
+    // resolvePermissionScopes.
+    const personalFilter = sql`
+      AND NOT EXISTS (
+        SELECT 1
+        FROM public.raw_events pre
+        JOIN public.source_connections psc
+          ON psc.id = pre.connection_id AND psc.tenant_id = pre.tenant_id
+        WHERE pre.id = d.origin_raw_event_id
+          AND pre.tenant_id = d.tenant_id
+          AND psc.source = ANY(${[...PERSONAL_SOURCES]}::text[])
+          AND psc.connected_by IS NOT NULL
+          AND psc.connected_by <> ${userId}::uuid
+      )
+    `;
     // Filtering happens here, not client-side, so "Gmail only" (etc.) reflects
     // the full archive across all pages, not just whatever page was loaded
     // before the filter was picked.
@@ -658,17 +703,18 @@ async function listDecisions(
     const rows = await sql`
       SELECT d.id, d.tenant_id, d.record_type, d.decision_statement, d.rationale,
              d.alternatives_considered, d.status, d.superseded_by, d.scope, d.confidence,
-             d.origin_raw_event_id, d.created_at, d.updated_at
+             d.origin_raw_event_id, d.created_at, d.updated_at,
+             d.valid_from, d.valid_until
       FROM decisions d
       LEFT JOIN raw_events re ON re.id = d.origin_raw_event_id AND re.tenant_id = d.tenant_id
-      WHERE d.tenant_id = ${tenantId} AND d.superseded_by IS NULL ${recordTypeFilter} ${sourceFilter}
+      WHERE d.tenant_id = ${tenantId} ${temporalFilter} ${recordTypeFilter} ${sourceFilter} ${personalFilter}
       ORDER BY d.created_at DESC LIMIT ${limit} OFFSET ${offset}
     `;
     const totalRows = await sql`
       SELECT COUNT(*)::int AS total
       FROM decisions d
       LEFT JOIN raw_events re ON re.id = d.origin_raw_event_id AND re.tenant_id = d.tenant_id
-      WHERE d.tenant_id = ${tenantId} AND d.superseded_by IS NULL ${recordTypeFilter} ${sourceFilter}
+      WHERE d.tenant_id = ${tenantId} ${temporalFilter} ${recordTypeFilter} ${sourceFilter} ${personalFilter}
     `;
     const total = totalRows[0]?.total ?? 0;
 
@@ -728,13 +774,30 @@ async function listDecisions(
   });
 }
 
-async function getDecisionById(tenantId: string, decisionId: string) {
+async function getDecisionById(tenantId: string, userId: string, decisionId: string) {
   return await withTenant(tenantId, async (sql) => {
+    // Scoped for the same reason listDecisions is, and it matters more
+    // here: this is addressable by id, so without it a teammate who
+    // learned a decision id could open one extracted from somebody else's
+    // private mailbox directly, bypassing every list that hid it.
     const rows = await sql`
       SELECT id, tenant_id, record_type, decision_statement, rationale,
              alternatives_considered, status, superseded_by, scope, confidence,
-             origin_raw_event_id, created_at, updated_at
-      FROM decisions WHERE id = ${decisionId} AND tenant_id = ${tenantId}
+             origin_raw_event_id, created_at, updated_at,
+             valid_from, valid_until
+      FROM decisions d
+      WHERE d.id = ${decisionId} AND d.tenant_id = ${tenantId}
+        AND NOT EXISTS (
+          SELECT 1
+          FROM public.raw_events pre
+          JOIN public.source_connections psc
+            ON psc.id = pre.connection_id AND psc.tenant_id = pre.tenant_id
+          WHERE pre.id = d.origin_raw_event_id
+            AND pre.tenant_id = d.tenant_id
+            AND psc.source = ANY(${[...PERSONAL_SOURCES]}::text[])
+            AND psc.connected_by IS NOT NULL
+            AND psc.connected_by <> ${userId}::uuid
+        )
     `;
     const row = rows[0];
     if (!row) return null;
@@ -886,9 +949,20 @@ const OWNER_SELECT = `
   )
 `;
 
-async function searchSimilarDecisions(tenantId: string, embedding: number[], topK: number): Promise<RetrievalMatch[]> {
+async function searchSimilarDecisions(
+  tenantId: string, embedding: number[], topK: number, asOf?: Date | null,
+): Promise<RetrievalMatch[]> {
   const vectorLiteral = "[" + embedding.join(",") + "]";
   return await withTenant(tenantId, async (sql) => {
+    // Retrieval previously filtered on tenant alone, so a superseded
+    // decision could be retrieved and cited as though it were still true -
+    // while the Decision Log, which does exclude them, showed otherwise.
+    // Same predicate as listDecisions now, and as_of additionally lets
+    // search reconstruct what was true at a past moment.
+    const temporalFilter = asOf
+      ? sql`AND d.valid_from <= ${asOf.toISOString()}::timestamptz
+            AND (d.valid_until IS NULL OR d.valid_until > ${asOf.toISOString()}::timestamptz)`
+      : sql`AND d.superseded_by IS NULL`;
     const rows = await sql`
       SELECT
         d.id AS decision_id, d.decision_statement,
@@ -899,7 +973,7 @@ async function searchSimilarDecisions(tenantId: string, embedding: number[], top
       FROM public.decision_embeddings de
       JOIN public.decisions d ON d.id = de.decision_id AND d.tenant_id = de.tenant_id
       LEFT JOIN public.raw_events r ON r.id = d.origin_raw_event_id AND r.tenant_id = d.tenant_id
-      WHERE d.tenant_id = ${tenantId}
+      WHERE d.tenant_id = ${tenantId} ${temporalFilter}
       ORDER BY de.embedding <=> ${vectorLiteral}::vector ASC
       LIMIT ${topK}
     `;
@@ -913,10 +987,16 @@ async function searchSimilarDecisions(tenantId: string, embedding: number[], top
   });
 }
 
-async function searchDecisionsKeyword(tenantId: string, question: string, topK: number): Promise<RetrievalMatch[]> {
+async function searchDecisionsKeyword(
+  tenantId: string, question: string, topK: number, asOf?: Date | null,
+): Promise<RetrievalMatch[]> {
   const query = question.trim();
   if (!query) return [];
   return await withTenant(tenantId, async (sql) => {
+    const temporalFilter = asOf
+      ? sql`AND d.valid_from <= ${asOf.toISOString()}::timestamptz
+            AND (d.valid_until IS NULL OR d.valid_until > ${asOf.toISOString()}::timestamptz)`
+      : sql`AND d.superseded_by IS NULL`;
     const rows = await sql`
       SELECT
         d.id AS decision_id, d.decision_statement,
@@ -929,7 +1009,7 @@ async function searchDecisionsKeyword(tenantId: string, question: string, topK: 
         r.source AS source
       FROM public.decisions d
       LEFT JOIN public.raw_events r ON r.id = d.origin_raw_event_id AND r.tenant_id = d.tenant_id
-      WHERE d.tenant_id = ${tenantId}
+      WHERE d.tenant_id = ${tenantId} ${temporalFilter}
         AND to_tsvector('english', d.decision_statement || ' ' || COALESCE(d.rationale, ''))
             @@ websearch_to_tsquery('english', ${query})
       ORDER BY similarity_score DESC, d.created_at DESC
@@ -990,12 +1070,17 @@ function fuseRrf(vectorMatches: RetrievalMatch[], keywordMatches: RetrievalMatch
 async function hybridRetrieve(
   tenantId: string, question: string, topK: number, candidateK: number,
   embeddingQuery: string, keywordQuery: string,
+  // Callers that already have an embedding in flight in parallel with other
+  // work (see handleSearch) can pass it here to skip a redundant embedQuery
+  // call. Falls back to computing it inline, same as before, when omitted.
+  precomputedEmbedding?: number[],
+  asOf?: Date | null,
 ): Promise<RetrievalMatch[]> {
   const fetchK = Math.max(candidateK, topK);
-  const embedding = await embedQuery(embeddingQuery || question);
+  const embedding = precomputedEmbedding ?? await embedQuery(embeddingQuery || question);
   const [vectorMatches, keywordMatches] = await Promise.all([
-    searchSimilarDecisions(tenantId, embedding, fetchK),
-    searchDecisionsKeyword(tenantId, keywordQuery || question, fetchK),
+    searchSimilarDecisions(tenantId, embedding, fetchK, asOf),
+    searchDecisionsKeyword(tenantId, keywordQuery || question, fetchK, asOf),
   ]);
   return fuseRrf(vectorMatches, keywordMatches, fetchK);
 }
@@ -1009,14 +1094,72 @@ function isUnmappedScope(scope: string): boolean {
   return SLACK_CHANNEL_RE.test(scope) || NOTION_ID_RE.test(scope);
 }
 
-function isDecisionAccessible(permissionScopes: string[], decision: RetrievalMatch): boolean {
+/**
+ * Real per-scope membership, loaded once per request from
+ * public.source_scope_members (populated by slack-membership-sync).
+ *
+ * `known` is every scope we have ANY membership data for; `memberOf` is the
+ * subset the caller is actually in. The distinction is the whole safety
+ * mechanism: a scope we have never synced stays on the old permissive
+ * behaviour, so shipping this can't retroactively hide content people are
+ * currently, correctly seeing. Coverage tightens as the sync fills in.
+ */
+type ScopeAccess = { known: Set<string>; memberOf: Set<string> };
+
+const EMPTY_SCOPE_ACCESS: ScopeAccess = { known: new Set(), memberOf: new Set() };
+
+async function loadScopeAccess(
+  tenantId: string, email: string | null, scopes: string[],
+): Promise<ScopeAccess> {
+  const candidates = [...new Set(scopes.filter(isUnmappedScope))];
+  if (candidates.length === 0) return EMPTY_SCOPE_ACCESS;
+
+  try {
+    const rows = await withTenant(tenantId, async (sql) => {
+      return await sql`
+        select external_scope_id,
+               bool_or(lower(member_email) = lower(${email ?? ""})) as is_member
+        from public.source_scope_members
+        where tenant_id = ${tenantId}::uuid
+          and external_scope_id = any(${candidates}::text[])
+        group by external_scope_id
+      `;
+    });
+    const known = new Set<string>();
+    const memberOf = new Set<string>();
+    for (const row of rows as unknown as { external_scope_id: string; is_member: boolean }[]) {
+      known.add(row.external_scope_id);
+      if (row.is_member) memberOf.add(row.external_scope_id);
+    }
+    return { known, memberOf };
+  } catch (err) {
+    // Fail OPEN on a lookup error rather than locking a tenant out of their
+    // own memory because a telemetry-adjacent table is unavailable. The
+    // deny path below only ever engages on data we successfully read.
+    console.error("scope membership lookup failed, falling back to legacy behaviour:", err);
+    return EMPTY_SCOPE_ACCESS;
+  }
+}
+
+function isDecisionAccessible(
+  permissionScopes: string[], decision: RetrievalMatch, access: ScopeAccess,
+): boolean {
   if (!decision.permission_scope || decision.permission_scope.length === 0) return true;
+  // Workspace-level scopes and the caller's own email, unchanged.
   if (decision.permission_scope.some((s) => permissionScopes.includes(s))) return true;
+  // Real membership: the caller is in one of the channels this came from.
+  if (decision.permission_scope.some((s) => access.memberOf.has(s))) return true;
+  // We have real membership data for at least one of these scopes and the
+  // caller is in none of them - this is the case that used to fail open.
+  if (decision.permission_scope.some((s) => access.known.has(s))) return false;
+  // No membership data for any scope yet: unchanged legacy behaviour.
   return decision.permission_scope.every(isUnmappedScope);
 }
 
-function filterAccessibleDecisions(permissionScopes: string[], matches: RetrievalMatch[]): RetrievalMatch[] {
-  return matches.filter((m) => isDecisionAccessible(permissionScopes, m));
+function filterAccessibleDecisions(
+  permissionScopes: string[], matches: RetrievalMatch[], access: ScopeAccess,
+): RetrievalMatch[] {
+  return matches.filter((m) => isDecisionAccessible(permissionScopes, m, access));
 }
 
 // ── Context builder (mirrors modules/context/formatter.py, byte-for-byte) ─
@@ -1207,6 +1350,156 @@ async function generateAnswer(question: string, context: string, analysis: Query
   return { answer: REFUSAL_TEXT, reasoning: toolOutput.reasoning, citations: [], confidence: toolOutput.confidence, model: SYNTHESIS_MODEL };
 }
 
+/**
+ * Pulls the current value of a string field out of JSON that is still being
+ * written.
+ *
+ * Needed because the answer arrives as a forced tool call, so Claude streams
+ * the tool's *arguments* as `input_json_delta` fragments rather than plain
+ * text. Mid-stream the buffer looks like:
+ *
+ *   {"sufficient_evidence": true, "answer": "On June 18 the team stand
+ *
+ * JSON.parse can't touch that, but the answer text is sitting right there.
+ * This walks the buffer and decodes escapes as it goes, stopping cleanly at
+ * a half-written escape sequence rather than emitting a broken character.
+ */
+function extractPartialString(buffer: string, key: string): string | null {
+  const marker = `"${key}"`;
+  const keyIdx = buffer.indexOf(marker);
+  if (keyIdx === -1) return null;
+
+  let i = keyIdx + marker.length;
+  while (i < buffer.length && buffer[i] !== ":") i++;
+  i++;
+  while (i < buffer.length && /\s/.test(buffer[i])) i++;
+  if (buffer[i] !== '"') return null;
+  i++;
+
+  let out = "";
+  while (i < buffer.length) {
+    const ch = buffer[i];
+    if (ch === "\\") {
+      const next = buffer[i + 1];
+      if (next === undefined) break; // escape split across chunks - wait for more
+      if (next === "n") out += "\n";
+      else if (next === "t") out += "\t";
+      else if (next === "r") out += "\r";
+      else if (next === "u") {
+        const hex = buffer.slice(i + 2, i + 6);
+        if (hex.length < 4) break; // partial unicode escape
+        out += String.fromCharCode(parseInt(hex, 16));
+        i += 6;
+        continue;
+      } else out += next; // covers escaped quote, backslash, anything else
+      i += 2;
+      continue;
+    }
+    if (ch === '"') break; // closing quote - field is complete
+    out += ch;
+    i++;
+  }
+  return out;
+}
+
+/**
+ * Same call and same forced tool as generateAnswer, but streamed: onDelta
+ * receives each newly-written slice of the answer as Claude produces it.
+ *
+ * Total time is unchanged - this only stops the user staring at nothing for
+ * the ~4.9s the synthesis call measured. The structured result (citations,
+ * confidence, refusal handling) is still parsed from the completed JSON at
+ * the end, so the final payload is identical to the non-streaming path.
+ */
+async function generateAnswerStreaming(
+  question: string,
+  context: string,
+  analysis: QueryAnalysis | null,
+  onDelta: (chunk: string) => void,
+): Promise<AnswerResult> {
+  const systemPrompt = buildSystemPrompt(analysis);
+  const userMessage = buildUserMessage(question, context, analysis);
+
+  const resp = await fetch("https://api.anthropic.com/v1/messages", {
+    method: "POST",
+    headers: {
+      "x-api-key": ANTHROPIC_API_KEY,
+      "anthropic-version": "2023-06-01",
+      "content-type": "application/json",
+    },
+    body: JSON.stringify({
+      model: SYNTHESIS_MODEL, max_tokens: 1024, temperature: 0, system: systemPrompt,
+      messages: [{ role: "user", content: userMessage }],
+      tools: [ANSWER_TOOL], tool_choice: { type: "tool", name: "submit_answer" },
+      stream: true,
+    }),
+  });
+  if (!resp.ok || !resp.body) {
+    throw new Error(`Anthropic API error ${resp.status}: ${await resp.text()}`);
+  }
+
+  const reader = resp.body.getReader();
+  const decoder = new TextDecoder();
+  let sseBuffer = "";
+  let jsonBuffer = "";
+  let emitted = "";
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    sseBuffer += decoder.decode(value, { stream: true });
+
+    // SSE frames are newline-delimited; a frame can straddle two chunks, so
+    // only whole lines are consumed and the remainder is kept.
+    const lines = sseBuffer.split("\n");
+    sseBuffer = lines.pop() ?? "";
+
+    for (const line of lines) {
+      if (!line.startsWith("data:")) continue;
+      const payload = line.slice(5).trim();
+      if (!payload || payload === "[DONE]") continue;
+      try {
+        const evt = JSON.parse(payload);
+        if (evt.type === "content_block_delta" && evt.delta?.type === "input_json_delta") {
+          jsonBuffer += evt.delta.partial_json ?? "";
+          const soFar = extractPartialString(jsonBuffer, "answer");
+          if (soFar !== null && soFar.length > emitted.length) {
+            onDelta(soFar.slice(emitted.length));
+            emitted = soFar;
+          }
+        }
+      } catch {
+        // A malformed frame is skipped rather than aborting the stream -
+        // the completed JSON below is still the source of truth.
+      }
+    }
+  }
+
+  let parsed: {
+    sufficient_evidence?: boolean; answer?: string; reasoning?: string;
+    citations?: number[]; confidence?: number;
+  };
+  try {
+    parsed = JSON.parse(jsonBuffer);
+  } catch {
+    throw new Error("Claude's streamed answer did not parse as valid JSON");
+  }
+
+  if (parsed.sufficient_evidence) {
+    return {
+      answer: parsed.answer ?? "",
+      reasoning: parsed.reasoning ?? "",
+      citations: [...new Set(parsed.citations ?? [])].sort((a, b) => a - b),
+      confidence: parsed.confidence ?? 0,
+      model: SYNTHESIS_MODEL,
+    };
+  }
+  return {
+    answer: REFUSAL_TEXT, reasoning: parsed.reasoning ?? "",
+    citations: [], confidence: parsed.confidence ?? 0, model: SYNTHESIS_MODEL,
+  };
+}
+
 function buildCitations(citationNumbers: number[], authorized: RetrievalMatch[]) {
   const citations = [];
   for (const number of citationNumbers) {
@@ -1247,7 +1540,7 @@ async function handleSearch(req: Request): Promise<Response> {
     return errorResponse(500, "Failed to enforce prompt limit");
   }
 
-  let body: { question?: string; top_k?: number };
+  let body: { question?: string; top_k?: number; stream?: boolean; as_of?: string };
   try {
     body = await req.json();
   } catch {
@@ -1255,11 +1548,27 @@ async function handleSearch(req: Request): Promise<Response> {
   }
   const question = (body.question ?? "").trim();
   if (!question) return errorResponse(422, "question is required");
+  const wantsStream = body.stream === true;
   const requestedTopK = Math.min(Math.max(body.top_k ?? DEFAULT_TOP_K, 1), MAX_TOP_K);
 
+  const searchStartedAt = Date.now();
+  const trace = new Trace();
   try {
-    const permissionScopes = await resolvePermissionScopes(ctx.userId, ctx.tenantId);
-    const analysis = await analyzeQuery(question);
+    const { scopes: permissionScopes, email } = await resolvePermissionScopes(ctx.userId, ctx.tenantId);
+    trace.mark("resolve_scopes");
+
+    // analyzeQuery and embedQuery are independent: embedQuery only needs the
+    // raw question text, not analyzeQuery's output (only the keyword-search
+    // half of hybridRetrieve needs analysis.keywords). Previously these ran
+    // sequentially - analyzeQuery's full Claude round trip finished before
+    // the Voyage embedding call even started - for no real reason. Running
+    // them concurrently removes one full LLM-call's worth of latency from
+    // every /search request at zero extra cost (same calls, same tokens).
+    const [analysis, precomputedEmbedding] = await Promise.all([
+      analyzeQuery(question),
+      embedQuery(question),
+    ]);
+    trace.mark("analyze_and_embed");
 
     let effectiveTopK = Math.max(requestedTopK, RERANK_MIN_TOP_K);
     if (analysis.is_multi_document) {
@@ -1267,18 +1576,102 @@ async function handleSearch(req: Request): Promise<Response> {
     }
     const candidateK = Math.max(DEFAULT_CANDIDATE_K, effectiveTopK * 2);
 
+    // Point-in-time search: {"as_of": "2026-09-01"} answers from the memory
+    // as it stood then, superseded entries included, rather than today's.
+    let searchAsOf: Date | null = null;
+    try {
+      searchAsOf = parseAsOf(typeof body.as_of === "string" ? body.as_of : null);
+    } catch {
+      return errorResponse(400, "as_of must be an ISO 8601 date or timestamp");
+    }
     const candidates = await hybridRetrieve(
       ctx.tenantId, question, effectiveTopK, candidateK, question, keywordSearchQuery(analysis),
+      precomputedEmbedding, searchAsOf,
     );
+    trace.mark("retrieve");
 
-    const authorized = filterAccessibleDecisions(permissionScopes, candidates);
+    const scopeAccess = await loadScopeAccess(
+      ctx.tenantId, email, candidates.flatMap((c) => c.permission_scope ?? []),
+    );
+    const authorized = filterAccessibleDecisions(permissionScopes, candidates, scopeAccess);
+    trace.mark("authorize");
+
     // No cross-encoder here (see file header) - truncate to effectiveTopK directly,
     // reproducing that module's own fail-open fallback path exactly.
     const finalMatches = authorized.slice(0, effectiveTopK);
 
     const context = formatContext(finalMatches);
+
+    // Streaming path. Same retrieval, same model, same forced tool - the
+    // only difference is that the answer reaches the browser as it is
+    // written instead of after the full ~4.9s synthesis call. Opt-in via
+    // {stream: true} so the existing non-streaming contract keeps working
+    // untouched for the MCP server and any other caller.
+    if (wantsStream) {
+      const encoder = new TextEncoder();
+      const sse = new ReadableStream({
+        async start(controller) {
+          const send = (event: string, data: unknown) => {
+            controller.enqueue(encoder.encode(
+              `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`,
+            ));
+          };
+          try {
+            const answerResult = await generateAnswerStreaming(
+              question, context, analysis, (chunk) => send("delta", { text: chunk }),
+            );
+            trace.mark("generate_answer");
+            trace.flag("streamed");
+
+            send("done", {
+              answer: answerResult.answer,
+              citations: buildCitations(answerResult.citations, finalMatches),
+              reasoning: answerResult.reasoning,
+              confidence: answerResult.confidence,
+              metadata: {
+                model: answerResult.model,
+                latency_ms: Date.now() - searchStartedAt,
+                stage_ms: trace.stages,
+                retrieved_count: candidates.length,
+                authorized_count: authorized.length,
+                decision_count: finalMatches.length,
+                token_estimate: estimateTokens(context),
+                question_type: analysis.question_type,
+                is_multi_document: analysis.is_multi_document,
+                reranked: false,
+                recency_reranked: true,
+                streamed: true,
+              },
+            });
+            void trace.write(ctx.tenantId, "POST /search");
+          } catch (err) {
+            const message = err instanceof Error ? err.message : "Search failed";
+            console.error("streaming search failed:", err);
+            send("error", { error: message });
+            void trace.write(ctx.tenantId, "POST /search", { ok: false, error: message });
+          } finally {
+            controller.close();
+          }
+        },
+      });
+
+      return new Response(sse, {
+        headers: {
+          ...corsHeaders,
+          "Content-Type": "text/event-stream",
+          "Cache-Control": "no-cache",
+          "Connection": "keep-alive",
+        },
+      });
+    }
+
     const answerResult = await generateAnswer(question, context, analysis);
     const citations = buildCitations(answerResult.citations, finalMatches);
+    trace.mark("generate_answer");
+
+    // Not awaited: a telemetry insert must never sit between the answer
+    // being ready and the caller receiving it.
+    void trace.write(ctx.tenantId, "POST /search");
 
     return jsonResponse({
       answer: answerResult.answer,
@@ -1287,7 +1680,8 @@ async function handleSearch(req: Request): Promise<Response> {
       confidence: answerResult.confidence,
       metadata: {
         model: answerResult.model,
-        latency_ms: 0,
+        latency_ms: Date.now() - searchStartedAt,
+        stage_ms: trace.stages,
         retrieved_count: candidates.length,
         authorized_count: authorized.length,
         decision_count: finalMatches.length,
@@ -1303,7 +1697,11 @@ async function handleSearch(req: Request): Promise<Response> {
     });
   } catch (err) {
     console.error("search failed:", err);
-    return errorResponse(502, err instanceof Error ? err.message : "Search failed");
+    const message = err instanceof Error ? err.message : "Search failed";
+    // Failures are the half of the data that matters most - a trace table
+    // that only records successes hides exactly the requests worth finding.
+    void trace.write(ctx.tenantId, "POST /search", { ok: false, error: message });
+    return errorResponse(502, message);
   }
 }
 
@@ -1441,7 +1839,7 @@ async function saveWeeklyDigest(tenantId: string, digest: any, weekOf: string, u
   });
 }
 
-async function generateTeamPulse(tenantId: string, permissionScopes: string[], scope: "personal" | "team", userId: string | null) {
+async function generateTeamPulse(tenantId: string, permissionScopes: string[], callerEmail: string | null, scope: "personal" | "team", userId: string | null) {
   let personalized = true;
   let question = TEAM_QUESTION;
   if (scope === "personal") {
@@ -1454,7 +1852,10 @@ async function generateTeamPulse(tenantId: string, permissionScopes: string[], s
   }
 
   const matches = await hybridRetrieve(tenantId, question, DIGEST_TOP_K, DIGEST_TOP_K, question, question);
-  const authorized = filterAccessibleDecisions(permissionScopes, matches);
+  const digestScopeAccess = await loadScopeAccess(
+    tenantId, callerEmail, matches.flatMap((m) => m.permission_scope ?? []),
+  );
+  const authorized = filterAccessibleDecisions(permissionScopes, matches, digestScopeAccess);
   const context = formatContext(authorized);
   
   // Use specialized friendly digest summary generation
@@ -1504,7 +1905,7 @@ async function handleDigest(req: Request, url: URL): Promise<Response> {
   const isCurrentWeek = requestedWeekOf === currentWeekOf;
 
   try {
-    const permissionScopes = await resolvePermissionScopes(ctx.userId, ctx.tenantId);
+    const { scopes: permissionScopes, email: callerEmail } = await resolvePermissionScopes(ctx.userId, ctx.tenantId);
     const userId = scope === "personal" ? ctx.userId : null;
 
     // A non-current week can only ever be served from what's already
@@ -1530,7 +1931,7 @@ async function handleDigest(req: Request, url: URL): Promise<Response> {
     // or count against either limiter.
     await enforceRouteRateLimit(ctx.tenantId, "digest");
     await enforceUserPromptLimit(ctx.userId);
-    const digest = await generateTeamPulse(ctx.tenantId, permissionScopes, scope, userId);
+    const digest = await generateTeamPulse(ctx.tenantId, permissionScopes, callerEmail, scope, userId);
     try {
       await saveWeeklyDigest(ctx.tenantId, digest, requestedWeekOf, userId);
     } catch (err) {
@@ -1589,7 +1990,7 @@ async function handleAttention(req: Request): Promise<Response> {
   }
 
   try {
-    const permissionScopes = await resolvePermissionScopes(ctx.userId, ctx.tenantId);
+    const { scopes: permissionScopes, email: attentionEmail } = await resolvePermissionScopes(ctx.userId, ctx.tenantId);
 
     const rows = await withTenant(ctx.tenantId, (sql) =>
       sql`
@@ -1609,13 +2010,20 @@ async function handleAttention(req: Request): Promise<Response> {
     // A conflict is attention-worthy for this viewer only if they could
     // see BOTH decisions it's between - showing "X conflicts with Y" when
     // the viewer can't even see what Y is would leak its existence.
-    const accessible = (rows as unknown as {
+    const conflictRows = rows as unknown as {
       id: string; reason: string; confidence: number; created_at: string;
       decision_id: string; decision_statement: string; decision_permission_scope: string[] | null;
       related_decision_id: string; related_decision_statement: string; related_permission_scope: string[] | null;
-    }[]).filter((r) =>
-      isDecisionAccessible(permissionScopes, { permission_scope: r.decision_permission_scope ?? [] } as RetrievalMatch) &&
-      isDecisionAccessible(permissionScopes, { permission_scope: r.related_permission_scope ?? [] } as RetrievalMatch)
+    }[];
+
+    const attentionAccess = await loadScopeAccess(
+      ctx.tenantId, attentionEmail,
+      conflictRows.flatMap((r) => [...(r.decision_permission_scope ?? []), ...(r.related_permission_scope ?? [])]),
+    );
+
+    const accessible = conflictRows.filter((r) =>
+      isDecisionAccessible(permissionScopes, { permission_scope: r.decision_permission_scope ?? [] } as RetrievalMatch, attentionAccess) &&
+      isDecisionAccessible(permissionScopes, { permission_scope: r.related_permission_scope ?? [] } as RetrievalMatch, attentionAccess)
     );
 
     const items: AttentionConflictItem[] = accessible.slice(0, ATTENTION_STRIP_LIMIT).map((r) => ({
@@ -1741,22 +2149,52 @@ async function handleDecisions(req: Request, url: URL): Promise<Response> {
     const offset = Math.max(Number(url.searchParams.get("offset") ?? 0), 0);
     const recordType = url.searchParams.get("record_type");
     const source = url.searchParams.get("source");
+    // Point-in-time reconstruction: ?as_of=2026-09-01 returns the memory as
+    // it stood then. Rejected rather than silently ignored when unparseable,
+    // since quietly returning today's answer to a historical question is
+    // worse than an error.
+    const asOfRaw = url.searchParams.get("as_of");
     try {
-      const result = await listDecisions(ctx.tenantId, limit, offset, recordType, source);
+      parseAsOf(asOfRaw);
+    } catch {
+      return errorResponse(400, "as_of must be an ISO 8601 date or timestamp");
+    }
+    // Traced because Memory Explorer / Decision Log were reported slow with
+    // nothing measuring them - this separates the list query itself from the
+    // token exchange that runs in front of it on a cold page load.
+    const listTrace = new Trace();
+    try {
+      const result = await listDecisions(ctx.tenantId, ctx.userId, limit, offset, recordType, source, asOfRaw);
+      listTrace.mark("list_decisions");
+      void listTrace.write(ctx.tenantId, "GET /decisions");
       return jsonResponse(result);
     } catch (err) {
       console.error("list decisions failed:", err);
+      listTrace.mark("list_decisions");
+      void listTrace.write(ctx.tenantId, "GET /decisions", {
+        ok: false,
+        error: err instanceof Error ? err.message : String(err),
+      });
       return errorResponse(500, "Failed to list decisions");
     }
   }
 
   if (req.method === "GET" && parts.length === 1) {
+    // Traced like /search: this is the "click a citation to see the source"
+    // path, and it was reported as slow with no way to see where the time
+    // went. getDecisionById runs several queries plus a possible live Slack
+    // name lookup, so the breakdown matters.
+    const detailTrace = new Trace();
     try {
-      const decision = await getDecisionById(ctx.tenantId, parts[0]);
+      const decision = await getDecisionById(ctx.tenantId, ctx.userId, parts[0]);
+      detailTrace.mark("load_decision");
       if (!decision) return errorResponse(404, "Decision not found");
+      void detailTrace.write(ctx.tenantId, "GET /decisions/:id");
       return jsonResponse(decision);
     } catch (err) {
       console.error("get decision failed:", err);
+      const message = err instanceof Error ? err.message : "Failed to fetch decision";
+      void detailTrace.write(ctx.tenantId, "GET /decisions/:id", { ok: false, error: message });
       return errorResponse(500, "Failed to fetch decision");
     }
   }
