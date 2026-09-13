@@ -59,7 +59,7 @@ jobs:
           VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
           VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
         run: |
-          npx vercel@latest deploy --prod --yes \
+          npx vercel@latest deploy --prod --yes --logs \
             --token="${{ secrets.VERCEL_TOKEN }}" > deployment-url.txt
           echo "Deployed: $(cat deployment-url.txt)"
           echo "### Deployed" >> $GITHUB_STEP_SUMMARY
