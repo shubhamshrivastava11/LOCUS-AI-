@@ -4,14 +4,23 @@ import type { User } from '@supabase/supabase-js'
 import { getSupabaseClient, isSupabaseConfigured } from '../lib/supabase'
 import { DEMO_EMAIL_KEY, WORKSPACES_DONE_KEY } from '../lib/sessionKeys'
 import { clearBackendSession, createCheckoutSession, getTenantPlan } from '../lib/api'
-import { PLANS } from '../../../supabase/functions/_shared/productFacts'
 
-// Same source loci-chat's system prompt builds its pricing section from -
-// a plan name/price change only needs to happen in that one file. The
-// actual price figures shown further down this page are baked into the
-// plan-header images and a mock invoice list, though, which can't pull
-// from shared data since they're not text - those stay manual.
-const PLAN_LABELS: Record<string, string> = Object.fromEntries(PLANS.map((p) => [p.id, p.name]))
+// These used to be imported from supabase/functions/_shared/productFacts,
+// which is where loci-chat's system prompt still builds its pricing section
+// from. That import cannot survive a deploy: Vercel's Root Directory for
+// this project is `frontend`, so only frontend/ is uploaded and anything
+// reached by ../../ simply is not there at build time. It typechecked
+// locally and in CI - where the whole repo exists - and failed only on
+// Vercel, which is the worst place to find out.
+//
+// So these two labels are duplicated here on purpose. If a plan is renamed
+// or added, productFacts.ts and this map both need it. The price figures
+// further down this page are baked into the plan-header images and a mock
+// invoice list anyway, so they were always a manual step.
+const PLAN_LABELS: Record<string, string> = {
+  self_serve: 'Individual',
+  team: 'Team',
+}
 
 function TrashIcon() {
   return (

@@ -54,6 +54,19 @@ jobs:
           npm ci
           npx tsc -b
 
+      # Vercel's Root Directory for this project is `frontend`, so a build
+      # only ever receives frontend/. An import that climbs out of it
+      # resolves fine here - the whole repo is checked out - and then fails
+      # on Vercel with TS2307. That is exactly how the first two runs of
+      # this workflow were lost, so it is checked rather than remembered.
+      - name: No imports outside the deploy root
+        run: |
+          if grep -rnE "from +['\"]\.\./\.\./\.\./" frontend/src frontend/landing-page; then
+            echo "::error::An import above frontend/ will not exist in the Vercel build."
+            exit 1
+          fi
+          echo "No imports escape frontend/."
+
       - name: Deploy to production
         env:
           VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}

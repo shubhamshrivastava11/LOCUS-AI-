@@ -14,14 +14,18 @@
 // script needed, since Supabase bundles this file into the function the
 // same way it already does for every other _shared/*.ts import.
 //
-// frontend/src/pages/AccountSettings.tsx imports the plan names from here
-// too, for the same reason. NOT everything pricing-related can be pulled
-// from here, though: the actual price figures shown to a real user in that
-// page are baked into the /individual-plan-header.png and
-// /team-plan-header.png images themselves (pre-rendered artwork, not text),
-// plus a hardcoded mock invoice list - those stay manual. If the price
-// changes, PLANS below, the two header images, and that mock invoice list
-// all need updating together.
+// The frontend CANNOT import this file. Vercel's Root Directory for the
+// frontend project is `frontend`, so a build only ever sees frontend/ -
+// frontend/src/pages/AccountSettings.tsx did import PLANS from here, which
+// typechecked locally and in CI and then failed the Vercel build with
+// TS2307. It now keeps its own copy of the two plan labels, marked as such.
+//
+// So: if a plan is renamed or added, change it here AND in that file's
+// PLAN_LABELS. The actual price figures shown to a real user are baked into
+// the /individual-plan-header.png and /team-plan-header.png images
+// themselves (pre-rendered artwork, not text), plus a hardcoded mock
+// invoice list - those were always manual. A price change means PLANS
+// below, the two header images, and that mock invoice list together.
 
 export type PlanFacts = {
   id: "self_serve" | "team";
