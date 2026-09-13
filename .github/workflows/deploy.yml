@@ -1,0 +1,66 @@
+# Deploys the frontend to Vercel on every push to main.
+#
+# Why a workflow instead of Vercel's own Git integration: connecting a
+# PRIVATE GitHub ORGANISATION repo to Vercel requires a Pro plan. The CLI
+# has no such restriction, so this drives it directly with a token and gets
+# push-to-deploy on the Hobby plan.
+#
+# Deliberately NOT using --prebuilt. Building here would mean copying the
+# VITE_* values into GitHub secrets as well, giving two places to keep in
+# sync and two places to leak from. Uploading the source and letting Vercel
+# build means the environment variables live in exactly one place: the
+# Vercel project.
+#
+# Required GitHub repository secrets (Settings > Secrets and variables >
+# Actions):
+#   VERCEL_TOKEN       - Vercel account token, from vercel.com/account/tokens
+#   VERCEL_ORG_ID      - from .vercel/project.json after `vercel link`
+#   VERCEL_PROJECT_ID  - from .vercel/project.json after `vercel link`
+#
+# Note on VERCEL_TOKEN: it grants full access to the Vercel account, and
+# anyone who can push a workflow change to this repo can read it. Scope it
+# to the Locus AI team and rotate it if someone leaves.
+
+name: Deploy to Vercel
+
+on:
+  push:
+    branches: [main]
+  # Manual trigger, for redeploying without an empty commit.
+  workflow_dispatch:
+
+# One deploy at a time. Two pushes in quick succession would otherwise race
+# and the older build could land last.
+concurrency:
+  group: vercel-production
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      # Typecheck before deploying. `vercel build` would catch this too, but
+      # failing here is faster and the error is easier to read than it is
+      # buried in Vercel's build log.
+      - name: Install and typecheck
+        working-directory: frontend
+        run: |
+          npm ci
+          npx tsc -b
+
+      - name: Deploy to production
+        env:
+          VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
+          VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
+        run: |
+          npx vercel@latest deploy --prod --yes \
+            --token="${{ secrets.VERCEL_TOKEN }}" > deployment-url.txt
+          echo "Deployed: $(cat deployment-url.txt)"
+          echo "### Deployed" >> $GITHUB_STEP_SUMMARY
+          echo "$(cat deployment-url.txt)" >> $GITHUB_STEP_SUMMARY
