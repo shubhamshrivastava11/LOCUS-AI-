@@ -33,14 +33,21 @@ jobs:
       # Typechecks every function entrypoint, which pulls in all of _shared
       # with it. This catches the Deno-side equivalent of the TS2307 that took
       # two failed deploys to surface on the frontend.
+      # --node-modules-dir=none is not a CI workaround, it is the accurate
+      # check. The repo root has a package.json, so Deno otherwise resolves
+      # npm: specifiers through a local node_modules that exists on a
+      # developer machine and never on a fresh checkout - nor in Supabase's
+      # runtime, which has no node_modules at all. Without it this step
+      # passes locally and fails here, which is the same split that cost two
+      # deploys on the frontend.
       - name: Typecheck
-        run: deno check supabase/functions/*/index.ts
+        run: deno check --node-modules-dir=none supabase/functions/*/index.ts
 
       # financialRedaction.test.ts and temporal.test.ts. 24 tests covering
       # redaction of anything money-shaped before it is stored, and the
       # valid_from/valid_until boundary rules the temporal model depends on.
       - name: Tests
-        run: deno test --allow-all supabase/functions/_shared/
+        run: deno test --node-modules-dir=none --allow-all supabase/functions/_shared/
 
   frontend:
     name: Frontend

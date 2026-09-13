@@ -1,0 +1,178 @@
+# Deploys Supabase edge functions.
+#
+# WHY THIS EXISTS
+#
+# Every one of the 41 functions was deployed by a person typing a command, and
+# one of those commands carries a security-relevant flag: --no-verify-jwt. Get
+# it wrong in the "on" direction and the gateway stops checking tokens. Get it
+# wrong in the "off" direction - the easier mistake, because it is the DEFAULT -
+# and a webhook starts returning 401 to Slack and Microsoft Graph. Nothing in
+# Locus logs that. The connection still reads "active" in Settings. Ingestion
+# just stops, which is the same silent failure that cost 62 Notion decisions
+# their embeddings.
+#
+# The flag is now declared per function in supabase/config.toml, so the CLI
+# reads it from a file under review instead of from someone's memory, and this
+# workflow never passes it at all. The final step re-reads the platform and
+# fails if what is deployed disagrees with what the file says, so a drift or a
+# CLI behaviour change surfaces here rather than as silence in ingestion.
+#
+# SCOPE
+#
+# Only functions whose own files changed are deployed. A change under _shared/
+# or to config.toml touches everything, so those deploy all 41.
+#
+# Required secret:
+#   SUPABASE_ACCESS_TOKEN - supabase.com/dashboard/account/tokens
+
+name: Deploy edge functions
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'supabase/functions/**'
+      - 'supabase/config.toml'
+      - '.github/workflows/deploy-functions.yml'
+  workflow_dispatch:
+    inputs:
+      deploy_all:
+        description: 'Deploy all functions, not just changed ones'
+        type: boolean
+        default: false
+
+concurrency:
+  group: supabase-functions
+  cancel-in-progress: false
+
+env:
+  # Not a secret. It is already visible in the frontend bundle as
+  # https://imazdfzxinltbgktrgmv.supabase.co, so hiding it here would buy
+  # nothing and make the workflow harder to read.
+  PROJECT_REF: imazdfzxinltbgktrgmv
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.x
+
+      # Same checks CI runs. Repeated here rather than assumed, because this
+      # workflow writes to production and CI may not have finished.
+      - name: Typecheck and test
+        run: |
+          deno check --node-modules-dir=none supabase/functions/*/index.ts
+          deno test --node-modules-dir=none --allow-all supabase/functions/_shared/
+
+      - uses: supabase/setup-cli@v1
+        with:
+          version: latest
+
+      - name: Work out what to deploy
+        id: scope
+        run: |
+          set -euo pipefail
+          all() {
+            ls -1 supabase/functions \
+              | grep -v '^_' \
+              | while read -r d; do [ -d "supabase/functions/$d" ] && echo "$d"; done
+          }
+
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] \
+             && [ "${{ inputs.deploy_all }}" = "true" ]; then
+            echo "Manual run with deploy_all."
+            all > targets.txt
+          elif [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "Manual run without a diff to compare against, deploying all."
+            all > targets.txt
+          else
+            BEFORE="${{ github.event.before }}"
+            # A new branch, or a force push, gives no usable baseline. Deploy
+            # everything rather than silently deploying nothing.
+            if [ -z "$BEFORE" ] || [ "$BEFORE" = "0000000000000000000000000000000000000000" ] \
+               || ! git cat-file -e "$BEFORE^{commit}" 2>/dev/null; then
+              echo "No usable previous commit, deploying all."
+              all > targets.txt
+            else
+              CHANGED=$(git diff --name-only "$BEFORE" "${{ github.sha }}")
+              echo "Changed files:"; echo "$CHANGED" | sed 's/^/  /'
+              if echo "$CHANGED" | grep -qE '^supabase/(functions/_shared/|config\.toml)'; then
+                echo "Shared code or config changed, deploying all."
+                all > targets.txt
+              else
+                echo "$CHANGED" \
+                  | grep -oE '^supabase/functions/[^_/][^/]*' \
+                  | sed 's|supabase/functions/||' \
+                  | sort -u > targets.txt
+              fi
+            fi
+          fi
+
+          echo "Deploying:"; sed 's/^/  /' targets.txt
+          echo "count=$(wc -l < targets.txt)" >> "$GITHUB_OUTPUT"
+
+      - name: Deploy
+        if: steps.scope.outputs.count != '0'
+        env:
+          SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
+        run: |
+          set -euo pipefail
+          while read -r fn; do
+            [ -n "$fn" ] || continue
+            echo "::group::$fn"
+            # No --no-verify-jwt here, deliberately. config.toml owns it.
+            supabase functions deploy "$fn" --project-ref "$PROJECT_REF"
+            echo "::endgroup::"
+          done < targets.txt
+
+      # The guard the whole file exists for. If the CLI ever stops honouring
+      # config.toml, this is where we find out, not ingestion.
+      - name: Verify JWT settings match config.toml
+        env:
+          SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
+        run: |
+          set -euo pipefail
+          supabase functions list --project-ref "$PROJECT_REF" --output json > live.json
+          python3 - <<'PY'
+          import json, re, sys
+
+          want = {}
+          slug = None
+          for line in open("supabase/config.toml", encoding="utf-8"):
+              m = re.match(r"\s*\[functions\.([^\]]+)\]", line)
+              if m:
+                  slug = m.group(1)
+                  continue
+              if slug:
+                  v = re.match(r"\s*verify_jwt\s*=\s*(true|false)", line)
+                  if v:
+                      want[slug] = v.group(1) == "true"
+                      slug = None
+
+          data = json.load(open("live.json"))
+          fns = data["functions"] if isinstance(data, dict) else data
+          live = {f["slug"]: f["verify_jwt"] for f in fns}
+
+          problems = []
+          for s, expected in sorted(want.items()):
+              if s not in live:
+                  problems.append(f"{s}: declared in config.toml but not deployed")
+              elif live[s] != expected:
+                  problems.append(
+                      f"{s}: config.toml says verify_jwt={expected}, "
+                      f"platform says {live[s]}")
+          for s in sorted(set(live) - set(want)):
+              problems.append(f"{s}: deployed but not declared in config.toml")
+
+          if problems:
+              for p in problems:
+                  print(f"::error::{p}")
+              sys.exit(1)
+          print(f"All {len(want)} functions match config.toml.")
+          PY
