@@ -64,7 +64,7 @@ async function getAesKey(): Promise<CryptoKey> {
   return crypto.subtle.importKey("raw", hash, "AES-GCM", false, ["encrypt", "decrypt"]);
 }
 
-async function encryptRawContent(plaintext: Uint8Array): Promise<Uint8Array> {
+async function encryptRawContent(plaintext: Uint8Array<ArrayBuffer>): Promise<Uint8Array> {
   const key = await getAesKey();
   const nonce = crypto.getRandomValues(new Uint8Array(NONCE_LEN));
   const ciphertext = new Uint8Array(
@@ -802,8 +802,11 @@ type PgmqMsg = { msg_id: number; message: Record<string, unknown>; read_ct: numb
 
 async function pgmqRead(queue: string, batch: number): Promise<PgmqMsg[]> {
   return await withAdmin(async (sql) => {
-    const rows = await sql`SELECT * FROM pgmq.read(${queue}, ${VISIBILITY_TIMEOUT_SECONDS}, ${batch})`;
-    return rows.map((r: { msg_id: number; message: Record<string, unknown>; read_ct: number }) => ({
+    // postgres.js returns its own opaque Row type, which no annotation on the
+    // callback can satisfy - the shape has to be asserted on the result
+    // instead. Same pattern as api/index.ts:1130. No runtime change.
+    const rows = await sql`SELECT * FROM pgmq.read(${queue}, ${VISIBILITY_TIMEOUT_SECONDS}, ${batch})` as unknown as PgmqMsg[];
+    return rows.map((r) => ({
       msg_id: r.msg_id, message: r.message, read_ct: r.read_ct,
     }));
   });
@@ -817,7 +820,9 @@ async function pgmqDelete(queue: string, msgId: number): Promise<void> {
 
 async function pgmqSend(queue: string, message: Record<string, unknown>): Promise<void> {
   await withAdmin(async (sql) => {
-    await sql`SELECT pgmq.send(${queue}, ${sql.json(message)}::jsonb)`;
+    // sql.json() wants postgres.js's own JSONValue type, which Record<string,
+    // unknown> never structurally satisfies. Same cast as _shared/queue.ts:96.
+    await sql`SELECT pgmq.send(${queue}, ${sql.json(message as any)}::jsonb)`;
   });
 }
 
@@ -1360,14 +1365,19 @@ async function detectConflicts(
             AND 1 - (de.embedding <=> ${vectorLiteral}::vector) >= ${CONFLICT_SIMILARITY_FLOOR}
           ORDER BY de.embedding <=> ${vectorLiteral}::vector ASC
           LIMIT ${CONFLICT_CANDIDATE_LIMIT}
-        `;
+        ` as unknown as {
+          id: string;
+          decision_statement: string;
+          rationale: string | null;
+          created_at: string;
+        }[];
         if (rows.length === 0) return { candidates: [], newDecisionCreatedAt: null, newDecisionParticipants: [] };
 
         const newRow = await sql`SELECT created_at FROM public.decisions WHERE id = ${decisionId} AND tenant_id = ${tenantId}`;
-        const names = await getParticipantNames(sql, tenantId, [decisionId, ...rows.map((r: { id: string }) => r.id)]);
+        const names = await getParticipantNames(sql, tenantId, [decisionId, ...rows.map((r) => r.id)]);
 
         const candidates = rows.map(
-          (r: { id: string; decision_statement: string; rationale: string | null; created_at: string }) => ({
+          (r) => ({
             id: r.id,
             decision_statement: r.decision_statement,
             rationale: r.rationale,

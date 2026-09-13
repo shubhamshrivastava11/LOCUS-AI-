@@ -54,7 +54,7 @@ async function importHmacKey(secret: string): Promise<CryptoKey> {
   );
 }
 
-function base64urlDecode(str: string): Uint8Array {
+function base64urlDecode(str: string): Uint8Array<ArrayBuffer> {
   // Pad to multiple of 4, convert URL-safe chars
   const padded = str.replace(/-/g, "+").replace(/_/g, "/");
   const pad = padded.length % 4;

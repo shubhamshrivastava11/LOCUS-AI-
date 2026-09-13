@@ -412,3 +412,156 @@ enabled = true
 # declarative_schema_path = "./database"
 # JSON string passed through to pg-delta SQL formatting.
 # format_options = "{\"keywordCase\":\"upper\",\"indent\":2,\"maxWidth\":80,\"commaStyle\":\"trailing\"}"
+
+# ---------------------------------------------------------------------------
+# Edge function JWT verification.
+#
+# Every entry below records what is ACTUALLY deployed, read from the platform
+# on 13 Sep 2026, not what anyone believed was deployed. It exists because
+# `verify_jwt` used to live only in whether someone remembered to type
+# `--no-verify-jwt` on the deploy command, and that is not a place to keep a
+# security-relevant setting.
+#
+# The failure mode is silent and one-directional. Deploying a webhook WITHOUT
+# the flag flips it to verify_jwt = true, and Slack, Microsoft Graph and every
+# OAuth callback immediately start receiving 401 from the gateway. Nothing in
+# Locus logs an error, the connection still reads "active" in Settings, and
+# ingestion just stops. That is the same invisible failure that cost 62 Notion
+# decisions their embeddings.
+#
+# verify_jwt = false does NOT mean unauthenticated. The gateway stops checking;
+# the function checks instead. `api` and `capture-source-rules` both call
+# supabase.auth.getUser(token) and return 401 themselves - see
+# capture-source-rules/index.ts:229. They are set false because they need to
+# resolve the tenant from the token rather than have the gateway accept or
+# reject it blind.
+#
+# Only the four admin-* functions below rely on the gateway.
+#
+# With these declared, `supabase functions deploy` reads the setting from here
+# and the flag never needs to be typed again. Change a value here, in a commit
+# someone can review, rather than in a terminal nobody sees.
+# ---------------------------------------------------------------------------
+
+[functions.admin-backfill-slack-permalinks]
+verify_jwt = true
+
+[functions.admin-bootstrap-schema]
+verify_jwt = true
+
+[functions.admin-debug-conversation]
+verify_jwt = false
+
+[functions.admin-dedupe-decisions]
+verify_jwt = true
+
+[functions.admin-fix-gmail-permalinks]
+verify_jwt = false
+
+[functions.admin-fix-notion-permalinks]
+verify_jwt = false
+
+[functions.admin-pipeline-status]
+verify_jwt = false
+
+[functions.admin-remove-paused-connections]
+verify_jwt = true
+
+[functions.ai-worker]
+verify_jwt = false
+
+[functions.api]
+verify_jwt = false
+
+[functions.capture-source-rules]
+verify_jwt = false
+
+[functions.clickup-oauth]
+verify_jwt = false
+
+[functions.clickup-poller]
+verify_jwt = false
+
+[functions.confluence-oauth]
+verify_jwt = false
+
+[functions.confluence-poller]
+verify_jwt = false
+
+[functions.delete-account]
+verify_jwt = false
+
+[functions.discord-oauth]
+verify_jwt = false
+
+[functions.discord-poller]
+verify_jwt = false
+
+[functions.export-account-data]
+verify_jwt = false
+
+[functions.github-oauth]
+verify_jwt = false
+
+[functions.github-poller]
+verify_jwt = false
+
+[functions.gmail-manual-sync]
+verify_jwt = false
+
+[functions.gmail-oauth]
+verify_jwt = false
+
+[functions.jira-oauth]
+verify_jwt = false
+
+[functions.jira-poller]
+verify_jwt = false
+
+[functions.loci-chat]
+verify_jwt = false
+
+[functions.loci-stats]
+verify_jwt = false
+
+[functions.mcp]
+verify_jwt = false
+
+[functions.monday-oauth]
+verify_jwt = false
+
+[functions.monday-poller]
+verify_jwt = false
+
+[functions.notion-oauth]
+verify_jwt = false
+
+[functions.notion-poller]
+verify_jwt = false
+
+[functions.purge-raw-events]
+verify_jwt = false
+
+[functions.search-history]
+verify_jwt = false
+
+[functions.slack-membership-sync]
+verify_jwt = false
+
+[functions.slack-oauth]
+verify_jwt = false
+
+[functions.slack-webhook]
+verify_jwt = false
+
+[functions.team-invites]
+verify_jwt = false
+
+[functions.teams-oauth]
+verify_jwt = false
+
+[functions.teams-subscription-renew]
+verify_jwt = false
+
+[functions.teams-webhook]
+verify_jwt = false

@@ -1,0 +1,70 @@
+# Checks that run on every push and every pull request, on every branch.
+#
+# deploy.yml gates the FRONTEND deploy. Nothing gated the backend at all: 41
+# edge functions and two test suites were only ever run by someone choosing to
+# run them locally. That is the half of the codebase holding the data, so it is
+# the half most worth checking automatically.
+#
+# Kept separate from deploy.yml deliberately. This runs everywhere, including
+# branches that will never deploy, so a problem is visible before the merge
+# rather than at the moment of shipping.
+
+name: CI
+
+on:
+  push:
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  backend:
+    name: Edge functions
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.x
+
+      # Typechecks every function entrypoint, which pulls in all of _shared
+      # with it. This catches the Deno-side equivalent of the TS2307 that took
+      # two failed deploys to surface on the frontend.
+      - name: Typecheck
+        run: deno check supabase/functions/*/index.ts
+
+      # financialRedaction.test.ts and temporal.test.ts. 24 tests covering
+      # redaction of anything money-shaped before it is stored, and the
+      # valid_from/valid_until boundary rules the temporal model depends on.
+      - name: Tests
+        run: deno test --allow-all supabase/functions/_shared/
+
+  frontend:
+    name: Frontend
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - run: npm ci
+
+      # The same command Vercel runs, so a green check here means the deploy
+      # will typecheck too.
+      - name: Typecheck
+        run: npx tsc -b
+
+      # Fails on errors, not warnings. There are warnings today and they are
+      # not worth blocking on; an actual error is.
+      - name: Lint
+        run: npx oxlint
