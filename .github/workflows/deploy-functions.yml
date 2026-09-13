@@ -70,6 +70,15 @@ jobs:
           deno check --node-modules-dir=none supabase/functions/*/index.ts
           deno test --node-modules-dir=none --allow-all supabase/functions/_shared/
 
+      # A missing token otherwise surfaces as an opaque CLI error two
+      # steps later, in a log nobody reads until something is already wrong.
+      - name: Check credentials
+        run: |
+          if [ -z "${{ secrets.SUPABASE_ACCESS_TOKEN }}" ]; then
+            echo "::error::SUPABASE_ACCESS_TOKEN is not set. Create one at https://supabase.com/dashboard/account/tokens then add it to this repo Actions secrets."
+            exit 1
+          fi
+
       - uses: supabase/setup-cli@v1
         with:
           version: latest
@@ -106,10 +115,13 @@ jobs:
                 echo "Shared code or config changed, deploying all."
                 all > targets.txt
               else
+                # No match means no function changed, which is a normal
+                # outcome such as a workflow-only commit. grep exits 1 on
+                # no match and pipefail would make that fail the run.
                 echo "$CHANGED" \
                   | grep -oE '^supabase/functions/[^_/][^/]*' \
                   | sed 's|supabase/functions/||' \
-                  | sort -u > targets.txt
+                  | sort -u > targets.txt || true
               fi
             fi
           fi
