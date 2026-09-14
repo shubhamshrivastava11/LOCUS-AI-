@@ -1,5 +1,6 @@
 import { useEffect, useState, type ReactNode } from 'react'
 import { getDecision, type DecisionConflict, type ThreadMessage } from '../lib/api'
+import { flagRecord } from '../lib/recordFlags'
 
 export type MemoryRecordType = 'Decision' | 'Blocker' | 'Action Item'
 export type MemoryStatus = 'Current' | 'Superseded'
@@ -254,9 +255,13 @@ function TruncatedMessageText({ text }: { text: string }) {
 export function FlagPanel({
   onCancel,
   onSubmit,
+  isSaving = false,
+  error = '',
 }: {
   onCancel: () => void
   onSubmit: (reason: FlagReason, note: string) => void
+  isSaving?: boolean
+  error?: string
 }) {
   const [reason, setReason] = useState<FlagReason | null>(null)
   const [note, setNote] = useState('')
@@ -293,24 +298,31 @@ export function FlagPanel({
         className="mt-3.5 h-11 w-full rounded-full border border-[#E5E7EB] px-4 text-[14px] text-[#111827] outline-none placeholder:text-[#9CA3AF] focus:border-[#5A45FF]"
       />
 
+      {error ? (
+        <p role="alert" className="mt-3 text-[13px] text-[#B42318]">
+          {error}
+        </p>
+      ) : null}
+
       <div className="mt-4 flex justify-end gap-2.5">
         <button
           type="button"
           onClick={onCancel}
-          className="rounded-lg border border-[#E5E7EB] bg-white px-4 py-2 text-[13px] font-semibold text-[#5A45FF] transition-colors hover:bg-[#F8F7FF]"
+          disabled={isSaving}
+          className="rounded-lg border border-[#E5E7EB] bg-white px-4 py-2 text-[13px] font-semibold text-[#5A45FF] transition-colors hover:bg-[#F8F7FF] disabled:cursor-not-allowed disabled:opacity-50"
         >
           Cancel
         </button>
         <button
           type="button"
-          disabled={!reason}
+          disabled={!reason || isSaving}
           onClick={() => {
-            if (!reason) return
+            if (!reason || isSaving) return
             onSubmit(reason, note)
           }}
           className="rounded-lg bg-[#5A45FF] px-4 py-2 text-[13px] font-semibold text-white transition-opacity hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-50"
         >
-          Submit Flag
+          {isSaving ? 'Saving...' : 'Submit Flag'}
         </button>
       </div>
     </div>
@@ -328,6 +340,8 @@ export function MemoryRecordDetail({
 }) {
   const [isFlagging, setIsFlagging] = useState(false)
   const [flagSubmitted, setFlagSubmitted] = useState(false)
+  const [flagError, setFlagError] = useState('')
+  const [isSavingFlag, setIsSavingFlag] = useState(false)
   const [thread, setThread] = useState<ThreadMessage[] | null>(null)
   const [threadError, setThreadError] = useState('')
   const [conflicts, setConflicts] = useState<DecisionConflict[]>([])
@@ -463,10 +477,28 @@ export function MemoryRecordDetail({
       {isFlagging ? (
         <FlagPanel
           onCancel={() => setIsFlagging(false)}
-          onSubmit={() => {
-            setIsFlagging(false)
-            setFlagSubmitted(true)
+          // This used to ignore both arguments and just flip the label to
+          // "Flagged". The reason and note were collected and discarded, so a
+          // report of a wrong extraction was confirmed to the user and never
+          // stored. The panel now stays open on failure rather than claiming a
+          // save that did not happen.
+          onSubmit={(reason, note) => {
+            setIsSavingFlag(true)
+            setFlagError('')
+            void flagRecord(record.id, reason, note)
+              .then(() => {
+                setIsFlagging(false)
+                setFlagSubmitted(true)
+              })
+              .catch((err: unknown) => {
+                setFlagError(
+                  err instanceof Error ? err.message : 'Could not save that flag. Try again.',
+                )
+              })
+              .finally(() => setIsSavingFlag(false))
           }}
+          isSaving={isSavingFlag}
+          error={flagError}
         />
       ) : null}
     </div>
