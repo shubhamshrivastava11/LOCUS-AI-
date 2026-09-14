@@ -45,6 +45,12 @@ const VISIBILITY_TIMEOUT_SECONDS = 60;
 // block a queue for 19 hours, and zero retry is what silently lost 62
 // decisions from semantic search. See handleEmbeddingMessage's catch.
 const MAX_EMBEDDING_ATTEMPTS = 5;
+// Ingestion had no retry budget at all - it deleted on any error, so a
+// single transient database blip lost the event permanently. Bounded at 3
+// because a retry re-runs extraction, and extraction costs a Claude call:
+// three is enough to ride out a blip and cheap enough that a genuinely
+// poisoned message cannot run up a bill.
+const MAX_INGESTION_ATTEMPTS = 3;
 
 // ── Encryption (matches modules.security.encryption exactly) ─────────────
 // AES-256-GCM, key = SHA-256(secret), blob = "LOCUS1" + 12-byte nonce +
@@ -826,6 +832,57 @@ async function pgmqSend(queue: string, message: Record<string, unknown>): Promis
   });
 }
 
+/**
+ * Parks a message we are giving up on, with the reason, instead of destroying
+ * it.
+ *
+ * pgmq.delete() does NOT archive - that is pgmq.archive(). Verified on
+ * 14 Sep 2026: pgmq.a_ingestion and pgmq.a_embedding_queue were both empty
+ * after months of traffic, so everything either queue had ever abandoned was
+ * gone without trace.
+ *
+ * If the dead_letters insert fails, the message is deliberately left QUEUED
+ * rather than deleted. That trades a visible backlog for invisible data loss,
+ * which is the right way round: a growing queue shows up in
+ * admin-pipeline-status, whereas a silently dropped event shows up nowhere
+ * until someone goes looking for data that should have been there.
+ */
+async function deadLetter(
+  queue: string,
+  msg: PgmqMsg,
+  err: unknown,
+  attempts: number,
+): Promise<void> {
+  const payload = (msg.message ?? {}) as Record<string, unknown>;
+  const detail = err instanceof Error ? (err.stack ?? err.message) : String(err);
+  const tenantId = typeof payload.tenant_id === "string" ? payload.tenant_id : null;
+  const source = typeof payload.source === "string" ? payload.source : null;
+  const sourceId = typeof payload.source_id === "string" ? payload.source_id : null;
+
+  try {
+    await withAdmin(async (sql) => {
+      await sql`
+        insert into public.dead_letters
+          (queue, msg_id, tenant_id, source, source_id, payload, error, attempts)
+        values (
+          ${queue}, ${msg.msg_id}::bigint, ${tenantId}::uuid,
+          ${source}, ${sourceId},
+          ${sql.json(payload as any)}::jsonb,
+          ${detail.slice(0, 4000)}, ${attempts}
+        )
+      `;
+    });
+  } catch (writeErr) {
+    console.error(
+      `dead_letters insert failed for ${queue}/${msg.msg_id} - leaving it queued rather than losing it:`,
+      writeErr,
+    );
+    return;
+  }
+  await pgmqDelete(queue, msg.msg_id);
+  console.error(`Dead-lettered ${queue}/${msg.msg_id} after ${attempts} attempt(s):`, detail);
+}
+
 // ── Ingestion pipeline (mirrors event_worker._handle_message) ────────────
 
 // Signals a failure that will NEVER succeed on retry (e.g. the tenant
@@ -842,18 +899,29 @@ async function handleIngestionMessage(msg: PgmqMsg): Promise<string> {
   try {
     return await handleIngestionMessageInner(msg);
   } catch (err) {
-    // Delete message on ANY error to prevent retry loops that cause repeated Claude calls
-    await pgmqDelete("ingestion", msg.msg_id);
-    
+    // No active connection to attribute this to; retrying cannot change that.
     if (err instanceof NonRetryableIngestionError) {
+      await deadLetter("ingestion", msg, err, msg.read_ct);
       return "abandoned_no_active_connection";
     }
-    
-    // Log the error for monitoring while preventing expensive retry loops
-    console.error("Ingestion error, message deleted to prevent retry loop:", err);
-    return "error_deleted";
+
+    // This used to delete on ANY error, to stop a bad message retrying
+    // forever and re-billing a Claude call each time. read_ct bounds that
+    // properly instead, so a transient failure now recovers rather than
+    // costing the event.
+    if (msg.read_ct < MAX_INGESTION_ATTEMPTS) {
+      console.error(
+        `Ingestion error (attempt ${msg.read_ct}/${MAX_INGESTION_ATTEMPTS}), left queued for retry:`,
+        err,
+      );
+      return "error_retrying";
+    }
+
+    await deadLetter("ingestion", msg, err, msg.read_ct);
+    return "error_dead_lettered";
   }
 }
+
 
 /**
  * Whether the tenant has switched this specific item off in Build Memory.
@@ -1516,9 +1584,8 @@ async function handleEmbeddingMessage(msg: PgmqMsg): Promise<string> {
       );
       return "error_retrying";
     }
-    await pgmqDelete("embedding_queue", msg.msg_id);
-    console.error(`Embedding failed ${MAX_EMBEDDING_ATTEMPTS} times, message deleted:`, err);
-    return "error_deleted";
+    await deadLetter("embedding_queue", msg, err, msg.read_ct);
+    return "error_dead_lettered";
   }
 }
 

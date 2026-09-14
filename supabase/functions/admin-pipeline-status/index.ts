@@ -90,20 +90,31 @@ Deno.serve(async (req) => {
         SELECT id, record_type, confidence, created_at FROM public.decisions
         WHERE created_at > now() - interval '24 hours' ORDER BY created_at ASC
       `;
-      // triage_at turns out to never be set on the KEEP/UNCERTAIN path (only
-      // pipeline_status='done' is - a real, separate gap from what this
-      // check was originally looking for) - pgmq's own archive table is the
-      // only remaining reliable "when did this actually get worked" signal,
-      // since ai-worker calls pgmq.delete() (moves to archive with a real
-      // archived_at) on every completed message regardless of outcome.
-      let archiveRows: unknown[] = [];
+      // This block used to read pgmq.a_ingestion on the belief that
+      // pgmq.delete() "moves to archive with a real archived_at". It does
+      // not - that is pgmq.archive(); delete() destroys. Checked on
+      // 14 Sep 2026: a_ingestion and a_embedding_queue were both empty after
+      // months of traffic, so this metric had been reporting zero processed
+      // messages for its entire life, and nobody noticed because zero is a
+      // plausible-looking number on a quiet queue.
+      //
+      // Replaced with the question it was actually trying to answer -
+      // what has the pipeline given up on - which dead_letters now records
+      // for real, with the reason attached.
+      let deadLetters24h: unknown[] = [];
       try {
-        archiveRows = await sql`
-          SELECT COUNT(*)::int AS n, MIN(archived_at) AS first, MAX(archived_at) AS last
-          FROM pgmq.a_ingestion WHERE archived_at > now() - interval '24 hours'
+        deadLetters24h = await sql`
+          SELECT queue,
+                 COUNT(*)::int AS n,
+                 COUNT(*) FILTER (WHERE replayed_at IS NULL)::int AS outstanding,
+                 MIN(failed_at) AS first,
+                 MAX(failed_at) AS last
+          FROM public.dead_letters
+          WHERE failed_at > now() - interval '24 hours'
+          GROUP BY queue
         ` as unknown as unknown[];
       } catch (err) {
-        archiveRows = [{ error: String(err) }];
+        deadLetters24h = [{ error: String(err) }];
       }
 
       // Reconciling a much smaller number the user saw elsewhere (likely
@@ -205,6 +216,10 @@ Deno.serve(async (req) => {
           time_range: triagedTimeRange[0] ?? null,
           decisions: decisionsLast24h,
         },
+        // What the pipeline gave up on. Empty is the healthy answer; a
+        // non-empty `outstanding` is work that was lost before dead_letters
+        // existed and is now recoverable from `payload`.
+        dead_letters_last_24h: deadLetters24h,
       };
     });
 
