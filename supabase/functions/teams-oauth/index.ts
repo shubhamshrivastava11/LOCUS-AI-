@@ -23,8 +23,8 @@ import { withTenant } from "../_shared/db.ts";
 import { ensureSourceConnectionDisplayNameColumn } from "../_shared/sourceConnectionSchema.ts";
 import {
   authorizeErrorResponse,
-  encodeState,
-  parseTenantState,
+  createOAuthState,
+  consumeOAuthState,
   popupCallbackResponse,
   resolveRedirectOrigin,
   resolveTenantFromAuthorize,
@@ -58,7 +58,7 @@ Deno.serve(async (req: Request) => {
       consent.searchParams.set("client_id", CLIENT_ID);
       consent.searchParams.set("scope", "https://graph.microsoft.com/.default");
       consent.searchParams.set("redirect_uri", REDIRECT_URI);
-      consent.searchParams.set("state", encodeState(tenantId, userId, redirectOrigin));
+      consent.searchParams.set("state", await createOAuthState(tenantId, userId, SOURCE, redirectOrigin));
 
       return Response.redirect(consent.toString(), 302);
     } catch (err) {
@@ -71,7 +71,7 @@ Deno.serve(async (req: Request) => {
     let userId: string;
     let redirectOrigin: string;
     try {
-      ({ tenantId, userId, redirectOrigin } = parseTenantState(url.searchParams.get("state")));
+      ({ tenantId, userId, redirectOrigin } = await consumeOAuthState(url.searchParams.get("state"), SOURCE));
     } catch (err) {
       return authorizeErrorResponse(SOURCE, err, resolveRedirectOrigin(url));
     }

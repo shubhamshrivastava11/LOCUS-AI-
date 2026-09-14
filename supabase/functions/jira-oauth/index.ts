@@ -22,8 +22,8 @@ import { withTenant } from "../_shared/db.ts";
 import { ensureSourceConnectionDisplayNameColumn } from "../_shared/sourceConnectionSchema.ts";
 import {
   authorizeErrorResponse,
-  encodeState,
-  parseTenantState,
+  createOAuthState,
+  consumeOAuthState,
   popupCallbackResponse,
   resolveRedirectOrigin,
   resolveTenantFromAuthorize,
@@ -67,7 +67,7 @@ Deno.serve(async (req: Request) => {
       authorizeUrl.searchParams.set("client_id", CLIENT_ID ?? "");
       authorizeUrl.searchParams.set("scope", SCOPES);
       authorizeUrl.searchParams.set("redirect_uri", REDIRECT_URI ?? "");
-      authorizeUrl.searchParams.set("state", encodeState(tenantId, userId, redirectOrigin, syncMode));
+      authorizeUrl.searchParams.set("state", await createOAuthState(tenantId, userId, SOURCE, redirectOrigin, syncMode));
       authorizeUrl.searchParams.set("response_type", "code");
       // Always show the consent screen, even for a user who's already
       // granted this app access before - a stale silent re-auth could
@@ -89,7 +89,7 @@ Deno.serve(async (req: Request) => {
     let redirectOrigin: string;
     let syncMode: "full" | "new";
     try {
-      ({ tenantId, userId, redirectOrigin, syncMode } = parseTenantState(url.searchParams.get("state")));
+      ({ tenantId, userId, redirectOrigin, syncMode } = await consumeOAuthState(url.searchParams.get("state"), SOURCE));
     } catch (err) {
       return authorizeErrorResponse(SOURCE, err, resolveRedirectOrigin(url));
     }

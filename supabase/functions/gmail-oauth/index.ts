@@ -2,8 +2,8 @@ import { withTenant } from "../_shared/db.ts";
 import { ensureSourceConnectionDisplayNameColumn } from "../_shared/sourceConnectionSchema.ts";
 import {
   authorizeErrorResponse,
-  encodeState,
-  parseTenantState,
+  createOAuthState,
+  consumeOAuthState,
   popupCallbackResponse,
   resolveRedirectOrigin,
   resolveTenantFromAuthorize,
@@ -52,7 +52,7 @@ Deno.serve(async (req: Request) => {
       googleAuthUrl.searchParams.set("scope", scopes.join(" "));
       googleAuthUrl.searchParams.set("access_type", "offline");
       googleAuthUrl.searchParams.set("prompt", "consent");
-      googleAuthUrl.searchParams.set("state", encodeState(tenantId, userId, redirectOrigin, syncMode));
+      googleAuthUrl.searchParams.set("state", await createOAuthState(tenantId, userId, SOURCE, redirectOrigin, syncMode));
 
       return Response.redirect(googleAuthUrl.toString(), 302);
     } catch (err) {
@@ -67,7 +67,7 @@ Deno.serve(async (req: Request) => {
     let redirectOrigin: string;
     let syncMode: "full" | "new";
     try {
-      ({ tenantId, userId, redirectOrigin, syncMode } = parseTenantState(url.searchParams.get("state")));
+      ({ tenantId, userId, redirectOrigin, syncMode } = await consumeOAuthState(url.searchParams.get("state"), SOURCE));
     } catch (err) {
       return authorizeErrorResponse(SOURCE, err, resolveRedirectOrigin(url));
     }

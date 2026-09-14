@@ -16,7 +16,7 @@
 // actor hitting the URL directly, and it does not reliably carry a
 // `state` param through the redirect (confirmed via GitHub community
 // reports, not just assumed). The standard user OAuth flow below reuses
-// this codebase's own encodeState/parseTenantState round trip instead,
+// this codebase's own createOAuthState/consumeOAuthState round trip instead,
 // which is what every other connector's tenant-resolution security
 // already rests on - GitHub Apps support this same flow via
 // https://github.com/login/oauth/authorize, no `scope` param needed
@@ -33,8 +33,8 @@ import { withTenant } from "../_shared/db.ts";
 import { ensureSourceConnectionDisplayNameColumn } from "../_shared/sourceConnectionSchema.ts";
 import {
   authorizeErrorResponse,
-  encodeState,
-  parseTenantState,
+  createOAuthState,
+  consumeOAuthState,
   popupCallbackResponse,
   resolveRedirectOrigin,
   resolveTenantFromAuthorize,
@@ -71,7 +71,7 @@ Deno.serve(async (req: Request) => {
       const authorizeUrl = new URL("https://github.com/login/oauth/authorize");
       authorizeUrl.searchParams.set("client_id", CLIENT_ID ?? "");
       authorizeUrl.searchParams.set("redirect_uri", REDIRECT_URI ?? "");
-      authorizeUrl.searchParams.set("state", encodeState(tenantId, userId, redirectOrigin));
+      authorizeUrl.searchParams.set("state", await createOAuthState(tenantId, userId, SOURCE, redirectOrigin));
 
       return Response.redirect(authorizeUrl.toString(), 302);
     } catch (err) {
@@ -86,7 +86,7 @@ Deno.serve(async (req: Request) => {
     let userId: string;
     let redirectOrigin: string;
     try {
-      ({ tenantId, userId, redirectOrigin } = parseTenantState(url.searchParams.get("state")));
+      ({ tenantId, userId, redirectOrigin } = await consumeOAuthState(url.searchParams.get("state"), SOURCE));
     } catch (err) {
       return authorizeErrorResponse(SOURCE, err, resolveRedirectOrigin(url));
     }

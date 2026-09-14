@@ -30,7 +30,7 @@ function isUuid(value: string): boolean {
  * Verifies the Supabase Auth JWT and that the user is a member of the tenant.
  * Returns userId too (previously verified then discarded) so callers can
  * carry it through OAuth state and record who actually connected a source -
- * see encodeState/parseTenantState and source_connections.connected_by.
+ * see createOAuthState/consumeOAuthState and source_connections.connected_by.
  */
 export async function resolveTenantFromAuthorize(url: URL): Promise<{ tenantId: string; userId: string }> {
   const tenantId = url.searchParams.get("tenant_id")?.trim() ?? "";
@@ -112,43 +112,110 @@ export function resolveRedirectOrigin(url: URL): string {
 // never reads this field even though it flows through the same state.
 export type SyncMode = "full" | "new";
 
-/** Carries tenant_id + userId + the resolved redirect origin (+ optional sync mode) through the provider's OAuth `state` round trip. */
-export function encodeState(tenantId: string, userId: string, redirectOrigin: string, syncMode?: SyncMode): string {
-  return btoa(JSON.stringify({ t: tenantId, u: userId, o: redirectOrigin, m: syncMode }));
+/**
+ * Mints a single-use OAuth state handle and returns its id.
+ *
+ * State used to be `btoa(JSON.stringify({t, u, o}))` - unsigned, so anyone
+ * could write one, and parseTenantState additionally accepted a BARE TENANT
+ * UUID, so `?state=<tenant-uuid>` was enough. /authorize verifies the access
+ * token and asserts membership, but none of that mattered: an attacker just
+ * never visited /authorize, completed the provider flow with their own
+ * account, and handed back a state naming somebody else's tenant. The
+ * connection - their credentials, their cursor_state - landed in that
+ * workspace.
+ *
+ * The handle now carries no information at all. It is a random uuid whose
+ * meaning lives in public.oauth_states, so it cannot be forged, read, or
+ * edited by whoever holds it.
+ */
+export async function createOAuthState(
+  tenantId: string,
+  userId: string,
+  source: string,
+  redirectOrigin: string,
+  syncMode?: SyncMode,
+): Promise<string> {
+  return await withAdmin(async (sql) => {
+    // Opportunistic sweep, so this needs no cron of its own. An hour is well
+    // past the 15-minute consume window; anything older is abandoned.
+    await sql`DELETE FROM public.oauth_states WHERE created_at < now() - interval '1 hour'`;
+
+    const rows = await sql`
+      INSERT INTO public.oauth_states (tenant_id, user_id, source, redirect_origin, sync_mode)
+      VALUES (
+        ${tenantId}::uuid,
+        ${userId || null}::uuid,
+        ${source},
+        ${redirectOrigin},
+        ${syncMode === "new" ? "new" : "full"}
+      )
+      RETURNING id
+    ` as unknown as { id: string }[];
+    return rows[0].id;
+  });
 }
 
-/** Read and validate tenant_id + userId + redirect origin (+ optional sync mode) carried in the provider OAuth `state` param. */
-export function parseTenantState(
+/**
+ * Redeems a state handle exactly once, or throws.
+ *
+ * Single-use by construction rather than by a check-then-act: the UPDATE's
+ * own WHERE clause is the guard, so two callbacks racing the same handle
+ * cannot both succeed - one updates the row, the other matches nothing.
+ *
+ * `source` is re-checked, so a handle minted for one provider is not
+ * redeemable at another's callback. Membership is re-asserted too: the state
+ * proves the flow started legitimately, not that the person is still entitled
+ * to the tenant by the time the provider redirects back.
+ */
+export async function consumeOAuthState(
   state: string | null,
-): { tenantId: string; userId: string; redirectOrigin: string; syncMode: SyncMode } {
-  if (!state) {
-    throw new OAuthTenantError("Missing OAuth state");
+  source: string,
+): Promise<{ tenantId: string; userId: string; redirectOrigin: string; syncMode: SyncMode }> {
+  if (!state || !isUuid(state.trim())) {
+    throw new OAuthTenantError("Missing or invalid OAuth state");
   }
 
-  let tenantId = "";
-  let userId = "";
-  let redirectOrigin = DEFAULT_FRONTEND_URL;
-  let syncMode: SyncMode = "full";
-  try {
-    const parsed = JSON.parse(atob(state)) as { t?: string; u?: string; o?: string; m?: string };
-    tenantId = parsed.t?.trim() ?? "";
-    userId = parsed.u?.trim() ?? "";
-    if (parsed.o && ALLOWED_FRONTEND_ORIGINS.includes(parsed.o)) {
-      redirectOrigin = parsed.o;
-    }
-    if (parsed.m === "new") syncMode = "new";
-  } catch {
-    // Back-compat: older links encoded state as a bare tenant_id UUID, from
-    // before userId was carried through at all - connected_by lands null
-    // for a callback completed from one of these, same as any other
-    // pre-attribution row.
-    tenantId = state.trim();
+  const rows = await withAdmin(async (sql) => {
+    return await sql`
+      UPDATE public.oauth_states
+      SET consumed_at = now()
+      WHERE id = ${state.trim()}::uuid
+        AND source = ${source}
+        AND consumed_at IS NULL
+        AND created_at > now() - interval '15 minutes'
+      RETURNING tenant_id, user_id, redirect_origin, sync_mode
+    ` as unknown as {
+      tenant_id: string;
+      user_id: string | null;
+      redirect_origin: string;
+      sync_mode: string;
+    }[];
+  });
+
+  if (rows.length === 0) {
+    // Deliberately one message for every cause - unknown, already used,
+    // expired, wrong provider. Telling the caller which would let them probe.
+    throw new OAuthTenantError("OAuth state is invalid, expired, or already used");
   }
 
-  if (!tenantId || !isUuid(tenantId)) {
-    throw new OAuthTenantError("Missing or invalid OAuth state (tenant_id)");
+  const row = rows[0];
+  const userId = row.user_id ?? "";
+  if (userId) {
+    await assertMembership(userId, row.tenant_id);
   }
-  return { tenantId, userId, redirectOrigin, syncMode };
+
+  // Re-validated rather than trusted: the allowlist may have changed since
+  // the state was minted, and this value is a redirect target.
+  const redirectOrigin = ALLOWED_FRONTEND_ORIGINS.includes(row.redirect_origin)
+    ? row.redirect_origin
+    : DEFAULT_FRONTEND_URL;
+
+  return {
+    tenantId: row.tenant_id,
+    userId,
+    redirectOrigin,
+    syncMode: row.sync_mode === "new" ? "new" : "full",
+  };
 }
 
 /**
