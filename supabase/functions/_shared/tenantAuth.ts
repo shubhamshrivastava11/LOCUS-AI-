@@ -94,14 +94,32 @@ export async function getCurrentTenant(req: Request): Promise<TenantContext> {
  */
 export const PERSONAL_SOURCES = ["gmail"] as const;
 
+/**
+ * `excludePersonalSources` drops personal-source scopes ENTIRELY, including
+ * the caller's own, rather than the usual "everyone else's but mine".
+ *
+ * That distinction is the whole fix for the team digest. Normally a caller
+ * should see their own Gmail; but content retrieved under one member's scopes
+ * used to be written into a tenant-wide cache keyed (tenant_id, week_of) with
+ * user_id NULL, and handed to every other member. The first person to open
+ * Team Pulse published their own inbox to the team.
+ *
+ * A shared artefact has to be built only from what every recipient may see, so
+ * the team path resolves scopes as though nobody had a personal source
+ * connected at all. The email is withheld for the same reason: Gmail's
+ * external_workspace_id IS the address, so returning it would put the scope
+ * back by another route.
+ */
 export async function resolvePermissionScopes(
   userId: string, tenantId: string,
+  options: { excludePersonalSources?: boolean } = {},
 ): Promise<{ scopes: string[]; email: string | null }> {
+  const excludePersonal = options.excludePersonalSources === true;
   // Two separate connections (admin pool vs tenant pool) - genuinely
   // independent, safe to run concurrently rather than paying both
   // round-trip latencies back to back.
   const [email, connectedScopes] = await Promise.all([
-    withAdmin(async (sql) => {
+    excludePersonal ? Promise.resolve(null) : withAdmin(async (sql) => {
       const rows = await sql`SELECT email FROM auth.users WHERE id = ${userId}`;
       return rows[0]?.email ?? null;
     }),
@@ -111,14 +129,16 @@ export async function resolvePermissionScopes(
         WHERE tenant_id = ${tenantId} AND status = 'active' AND external_workspace_id IS NOT NULL
           AND (
             source <> ALL(${[...PERSONAL_SOURCES]}::text[])
+            -- On the shared path the OR branches below are skipped entirely,
+            -- so no personal source qualifies for any reason.
+            OR (${!excludePersonal}
             -- Rows predating connected_by cannot be attributed to anyone.
             -- Left visible deliberately: excluding them would hide their
             -- own owner's mail from them, which is a worse failure than
             -- the leak it would prevent. Confirmed against live data that
             -- every such row today sits in a single-member tenant, so this
             -- carve-out currently exposes nothing.
-            OR connected_by IS NULL
-            OR connected_by = ${userId}::uuid
+            AND (connected_by IS NULL OR connected_by = ${userId}::uuid))
           )
       `;
       return rows.map((r) => r.external_workspace_id as string);

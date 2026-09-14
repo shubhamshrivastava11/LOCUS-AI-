@@ -1905,7 +1905,17 @@ async function handleDigest(req: Request, url: URL): Promise<Response> {
   const isCurrentWeek = requestedWeekOf === currentWeekOf;
 
   try {
-    const { scopes: permissionScopes, email: callerEmail } = await resolvePermissionScopes(ctx.userId, ctx.tenantId);
+    // A team digest is cached per (tenant, week) and served to every member,
+    // so it must be built only from content every member can see. Resolving
+    // scopes with personal sources excluded is what makes that true; without
+    // it the first person to open Team Pulse baked their own Gmail into a
+    // tenant-wide artefact. The personal digest is unaffected - it is cached
+    // per user and only ever returned to that user.
+    const { scopes: permissionScopes, email: callerEmail } = await resolvePermissionScopes(
+      ctx.userId,
+      ctx.tenantId,
+      { excludePersonalSources: scope === "team" },
+    );
     const userId = scope === "personal" ? ctx.userId : null;
 
     // A non-current week can only ever be served from what's already
