@@ -87,6 +87,31 @@ Deno.serve(async (req: Request) => {
   }
 
   if (privateTenantIds.length > 0) {
+    // dead_letters has no foreign key to tenants, on purpose - a message is
+    // parked exactly when something about it could not be reconciled, and
+    // "this tenant is gone" is one of those reasons, so the row has to be
+    // writable without a live tenant to point at (see
+    // 20260914020000_dead_letters_no_tenant_fk.sql). That means it is also
+    // not reached by the cascade below, and it holds raw source content in
+    // payload, so it has to be cleared explicitly and BEFORE the tenant row:
+    // if this fails, the account deletion stops rather than leaving that
+    // content behind with nothing pointing at it.
+    const { error: deadLetterError } = await supabase
+      .from("dead_letters")
+      .delete()
+      .in("tenant_id", privateTenantIds);
+
+    if (deadLetterError) {
+      console.error("Auth user deleted but dead_letters cleanup failed:", deadLetterError);
+      return jsonResponse(
+        {
+          error:
+            "Account deleted, but some workspace data requires administrator cleanup.",
+        },
+        500,
+      );
+    }
+
     const { error: tenantError } = await supabase
       .from("tenants")
       .delete()

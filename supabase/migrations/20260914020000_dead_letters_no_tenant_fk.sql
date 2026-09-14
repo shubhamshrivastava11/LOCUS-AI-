@@ -1,0 +1,28 @@
+-- Removes the foreign key from dead_letters.tenant_id to tenants.
+--
+-- Caught by a live end-to-end test rather than by review: a message was
+-- deliberately enqueued with a tenant id that does not exist, to watch it
+-- retry three times and then be parked. It retried past its budget - read_ct
+-- reached 6 - and was never parked. The dead-letter insert was failing on
+-- this constraint every time, and deadLetter()'s "leave it queued rather than
+-- lose it" fallback was correctly refusing to delete the message. The safety
+-- valve worked; the table was wrong.
+--
+-- The flaw is in the premise. A dead letter is recorded exactly when
+-- something about the message could not be reconciled with the system, and
+-- "the tenant no longer exists" is one of the likelier reasons a message gets
+-- abandoned - a workspace deleted while its events were still queued. A
+-- constraint that refuses the row precisely then makes the table useless in
+-- the case it exists to cover.
+--
+-- tenant_id stays as a plain uuid, for grouping and for the RLS policy. It
+-- simply no longer has to point at a live row.
+--
+-- GDPR consequence, handled rather than accepted: the FK carried
+-- ON DELETE CASCADE, and delete-account works by deleting the tenants row and
+-- letting cascades clear everything beneath it. Without the FK, dead letters
+-- would survive the account they belong to while still holding raw source
+-- content in payload. delete-account now removes them explicitly, before the
+-- tenant row goes.
+
+alter table public.dead_letters drop constraint if exists dead_letters_tenant_id_fkey;
