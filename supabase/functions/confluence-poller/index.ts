@@ -33,6 +33,9 @@ interface ConfluencePage {
   title: string;
   body?: { storage?: { value?: string } };
   version?: { when?: string; by?: { accountId?: string; displayName?: string } };
+  // Needs expand=space on the CQL search below, or this is always
+  // undefined and the space toggle silently matches nothing.
+  space?: { id?: number; key?: string };
   _links?: { webui?: string };
 }
 
@@ -69,7 +72,7 @@ Deno.serve(async (_req) => {
       // repeat that here without checking first.
       const searchUrl = new URL(`https://api.atlassian.com/ex/confluence/${cloudId}/rest/api/content/search`);
       searchUrl.searchParams.set("cql", cql);
-      searchUrl.searchParams.set("expand", "body.storage,version");
+      searchUrl.searchParams.set("expand", "body.storage,version,space");
       searchUrl.searchParams.set("limit", "50");
 
       const response = await fetch(searchUrl, {
@@ -108,6 +111,9 @@ Deno.serve(async (_req) => {
           actor_display_name: page.version?.by?.displayName,
           thread_ref: page.id,
           permission_scope: source.external_workspace_id ? [String(source.external_workspace_id)] : [],
+          // String(), because fetchRealItems stringifies Confluence's
+          // numeric space id and the two have to compare equal.
+          capture_item_id: page.space?.id !== undefined ? String(page.space.id) : undefined,
           known_actors: knownActors,
           raw_content: {
             subject: page.title,

@@ -68,6 +68,9 @@ interface JiraIssue {
     description?: unknown;
     updated?: string;
     creator?: { accountId?: string; displayName?: string };
+    // Requested so the envelope can carry capture_item_id. Without it the
+    // project toggle in Build Memory has nothing to match against.
+    project?: { id?: string; key?: string };
     comment?: { comments?: JiraComment[] };
   };
 }
@@ -103,7 +106,7 @@ Deno.serve(async (_req) => {
       // notion-poller already has (maxResults=50, no pagination loop).
       const searchUrl = new URL(`https://api.atlassian.com/ex/jira/${cloudId}/rest/api/3/search/jql`);
       searchUrl.searchParams.set("jql", jql);
-      searchUrl.searchParams.set("fields", "summary,description,updated,creator,comment");
+      searchUrl.searchParams.set("fields", "summary,description,updated,creator,comment,project");
       searchUrl.searchParams.set("maxResults", "50");
 
       const response = await fetch(searchUrl, {
@@ -159,6 +162,8 @@ Deno.serve(async (_req) => {
           actor_display_name: issue.fields.creator?.displayName,
           thread_ref: issue.key,
           permission_scope: source.external_workspace_id ? [String(source.external_workspace_id)] : [],
+          // Same id capture-source-rules lists this project under.
+          capture_item_id: issue.fields.project?.id,
           known_actors: knownActors,
           raw_content: {
             subject: issue.fields.summary ?? "",

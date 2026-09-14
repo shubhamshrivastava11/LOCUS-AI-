@@ -59,6 +59,9 @@ interface ClickUpTask {
   url?: string;
   date_updated?: string;
   creator?: ClickUpUser;
+  // /team/{id}/task returns the owning space on every task, which is the
+  // granularity Build Memory offers for ClickUp.
+  space?: { id?: string };
 }
 interface ClickUpComment {
   id: string;
@@ -136,6 +139,7 @@ Deno.serve(async (_req) => {
           actor_display_name: task.creator?.username,
           thread_ref: `task-${task.id}`,
           permission_scope: [],
+          capture_item_id: task.space?.id,
           known_actors: knownActorsFor(task.creator),
           raw_content: { subject: task.name ?? "", body },
           source_permalink: task.url,
@@ -167,6 +171,10 @@ Deno.serve(async (_req) => {
                 actor_display_name: comment.user?.username,
                 thread_ref: `task-${task.id}`,
                 permission_scope: [],
+                // A comment inherits its task's space: excluding a space
+                // has to exclude the conversation on its tasks too, or the
+                // toggle only half works.
+                capture_item_id: task.space?.id,
                 known_actors: knownActorsFor(comment.user),
                 raw_content: { subject: task.name ?? "", body: comment.comment_text ?? "" },
                 source_permalink: task.url,
