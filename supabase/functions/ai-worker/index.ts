@@ -635,6 +635,12 @@ function extractNotionPageText(page: any): string {
     const value = notionPropertyText(prop);
     if (value) lines.push(`${name}: ${value}`);
   }
+  // body_text is the page's actual content, added by notion-poller. Without
+  // it this returned title and properties only, so a decision written in the
+  // body - which is where people write them - was invisible to extraction.
+  // Older events have no body_text and behave exactly as before.
+  const body = typeof page.body_text === "string" ? page.body_text.trim() : "";
+  if (body) lines.push(body);
   return lines.length > 0 ? lines.join("\n") : (page.url ?? "Notion page");
 }
 

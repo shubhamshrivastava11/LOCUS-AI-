@@ -186,6 +186,10 @@ function extractNotionPageText(page: any): string {
     const value = notionPropertyText(prop);
     if (value) lines.push(`${name}: ${value}`);
   }
+  // Same body_text ai-worker extracts from, so a citation shows the reader the
+  // same page content the extraction actually saw.
+  const body = typeof page.body_text === "string" ? page.body_text.trim() : "";
+  if (body) lines.push(body);
   return lines.length > 0 ? lines.join("\n") : (page.url ?? "Notion page");
 }
 

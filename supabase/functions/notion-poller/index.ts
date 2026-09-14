@@ -1,5 +1,8 @@
 import { withAdmin, withTenant } from "../_shared/db.ts";
 import { enqueueEvent, IngestionEnvelope } from "../_shared/queue.ts";
+// Shared and unit-tested rather than inline here: this file is a
+// Deno.serve entrypoint and cannot be imported by a test.
+import { blockText, type NotionBlock } from "../_shared/notionBlocks.ts";
 import { decryptToken } from "../_shared/tokenCrypto.ts";
 
 console.log("Notion poller started!");
@@ -13,6 +16,71 @@ const NOTION_MAX_PAGES = 10;
 
 // Only the fields this poller actually reads are named; the rest of the
 // page object is passed through to raw_content untouched.
+// Bounds on body fetching. A Notion page is a tree, so without limits one
+// pathological page could issue unbounded API calls and hand extraction an
+// unbounded prompt. 300 blocks is far more than any page whose decisions are
+// findable anyway, and depth 3 covers headings > toggles > content without
+// chasing deeply nested databases.
+const NOTION_MAX_BLOCKS_PER_PAGE = 300;
+const NOTION_MAX_BLOCK_DEPTH = 3;
+
+/**
+ * Reads a page's body as plain text.
+ *
+ * The poller previously stored only the search result, which is properties
+ * and metadata - so a decision written in the page BODY, which is where
+ * people actually write them, was invisible to extraction. The page would be
+ * ingested, produce nothing, and look like it had been considered.
+ */
+async function fetchPageBody(
+  pageId: string,
+  accessToken: string,
+): Promise<string> {
+  const lines: string[] = [];
+  let budget = NOTION_MAX_BLOCKS_PER_PAGE;
+
+  async function walk(blockId: string, depth: number): Promise<void> {
+    if (depth > NOTION_MAX_BLOCK_DEPTH || budget <= 0) return;
+    let cursor: string | undefined = undefined;
+
+    do {
+      const url = new URL(`https://api.notion.com/v1/blocks/${blockId}/children`);
+      url.searchParams.set("page_size", "100");
+      if (cursor) url.searchParams.set("start_cursor", cursor);
+
+      const resp = await fetch(url.toString(), {
+        headers: {
+          Authorization: `Bearer ${accessToken}`,
+          "Notion-Version": "2022-06-28",
+        },
+      });
+      if (!resp.ok) {
+        // Body is an enrichment, not the event. A page whose blocks cannot be
+        // read still ingests with its properties, exactly as before this
+        // existed - degraded, not dropped.
+        console.error(`Notion blocks fetch failed for ${blockId}:`, await resp.text());
+        return;
+      }
+
+      const data = await resp.json();
+      const blocks = (data.results ?? []) as NotionBlock[];
+
+      for (const block of blocks) {
+        if (budget <= 0) return;
+        budget--;
+        const text = blockText(block);
+        if (text) lines.push(text);
+        if (block.has_children) await walk(block.id, depth + 1);
+      }
+
+      cursor = data.has_more ? (data.next_cursor as string | undefined) : undefined;
+    } while (cursor && budget > 0);
+  }
+
+  await walk(pageId, 0);
+  return lines.join("\n").trim();
+}
+
 interface NotionPage {
   id: string;
   last_edited_time: string;
@@ -135,7 +203,10 @@ Deno.serve(async (_req) => {
           // Build Memory lists Notion pages by page id, which is what the
           // toggle is stored against - not the workspace id above.
           capture_item_id: String(page.id),
-          raw_content: page,
+          // The search result plus the page's actual body. Previously only
+          // the former, so anything written in the page itself never reached
+          // extraction.
+          raw_content: { ...page, body_text: await fetchPageBody(page.id, accessToken) },
           // Notion's Search API already returns the page's real URL - no
           // extra lookup needed, unlike Slack/Gmail.
           source_permalink: typeof page.url === "string" ? page.url : undefined,
