@@ -981,7 +981,24 @@ async function handleIngestionMessageInner(msg: PgmqMsg): Promise<string> {
   // ingestion-level skip, not a display filter).
   const isPaused = await withTenant(tenantId, async (sql) => {
     const rows = await sql`SELECT learning_paused FROM public.tenants WHERE id = ${tenantId}`;
-    return rows.length > 0 && rows[0].learning_paused === true;
+    // `rows.length > 0 && ...` used to be the whole test, which quietly turned
+    // "I could not read the setting" into "the setting is off". It read zero
+    // rows every time: tenants has RLS enabled and forced, locus_app has no
+    // BYPASSRLS, and the table's only policy targeted the authenticated role,
+    // so withTenant() could never see it. Pause all learning was rendered in
+    // Settings and never once enforced.
+    //
+    // Fixed by 20260914030000_security_review_critical.sql, which adds the
+    // locus_app policy. Failing closed here is what stops it regressing
+    // silently: an unreadable setting now dead-letters the message with a
+    // clear reason instead of being read as consent to process.
+    if (rows.length === 0) {
+      throw new Error(
+        `Cannot read learning_paused for tenant ${tenantId} - refusing to process ` +
+          `rather than assume it is off. Check the locus_app SELECT policy on public.tenants.`,
+      );
+    }
+    return rows[0].learning_paused === true;
   });
   if (isPaused) {
     // No raw_events row written at all - nothing was learned, so there's
@@ -1230,7 +1247,16 @@ async function handleIngestionMessageInner(msg: PgmqMsg): Promise<string> {
   if (extraction.record_type === "action_item" || extraction.record_type === "blocker") {
     const isCoreKnowledgeOnly = await withTenant(tenantId, async (sql) => {
       const rows = await sql`SELECT core_knowledge_only FROM public.tenants WHERE id = ${tenantId}`;
-      return rows.length > 0 && rows[0].core_knowledge_only === true;
+      // Same unreadable-means-off bug as learning_paused above, and the same
+      // fix. One tenant has this switched on and had everything captured
+      // anyway for as long as the setting has existed.
+      if (rows.length === 0) {
+        throw new Error(
+          `Cannot read core_knowledge_only for tenant ${tenantId} - refusing to process ` +
+            `rather than assume it is off. Check the locus_app SELECT policy on public.tenants.`,
+        );
+      }
+      return rows[0].core_knowledge_only === true;
     });
     if (isCoreKnowledgeOnly) {
       await withTenant(tenantId, async (sql) => {

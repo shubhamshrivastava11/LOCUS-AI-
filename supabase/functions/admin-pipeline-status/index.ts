@@ -11,12 +11,21 @@
 // precise enough for a cost estimate; it doesn't need to be exact.
 
 import { withAdmin } from "../_shared/db.ts";
+import { requireInternalKey } from "../_shared/internalAuth.ts";
 
 function json(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body, null, 2), { status, headers: { "content-type": "application/json" } });
 }
 
 Deno.serve(async (req) => {
+  // Reads both work queues and can alter the ai-worker cron schedule from request parameters.
+  // Was deployed with verify_jwt = false and no check of any kind in
+  // the body, so anyone who knew the URL could call it. See
+  // _shared/internalAuth.ts for why a user JWT would not have been the
+  // right credential here.
+  const unauthorized = await requireInternalKey(req);
+  if (unauthorized) return unauthorized;
+
   const url = new URL(req.url);
   const pauseAiWorker = url.searchParams.get("pause_ai_worker") === "true";
   const resumeAiWorker = url.searchParams.get("resume_ai_worker") === "true";

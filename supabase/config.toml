@@ -449,17 +449,11 @@ verify_jwt = true
 [functions.admin-bootstrap-schema]
 verify_jwt = true
 
-[functions.admin-debug-conversation]
-verify_jwt = false
 
 [functions.admin-dedupe-decisions]
 verify_jwt = true
 
-[functions.admin-fix-gmail-permalinks]
-verify_jwt = false
 
-[functions.admin-fix-notion-permalinks]
-verify_jwt = false
 
 [functions.admin-pipeline-status]
 verify_jwt = false

@@ -9,6 +9,7 @@
 // deployed with --no-verify-jwt), same as admin-dedupe-decisions.
 
 import { withAdmin } from "../_shared/db.ts";
+import { requireInternalKey } from "../_shared/internalAuth.ts";
 
 const PRICE_PER_MTOK = { input: 1.0, output: 5.0, cacheWrite: 1.25, cacheRead: 0.1 };
 
@@ -26,6 +27,14 @@ function json(body: unknown, status = 200): Response {
 }
 
 Deno.serve(async (req) => {
+  // Exposes token spend and conversation volume across the whole product.
+  // Was deployed with verify_jwt = false and no check of any kind in
+  // the body, so anyone who knew the URL could call it. See
+  // _shared/internalAuth.ts for why a user JWT would not have been the
+  // right credential here.
+  const unauthorized = await requireInternalKey(req);
+  if (unauthorized) return unauthorized;
+
   if (req.method === "OPTIONS") return new Response(null, { headers: corsHeaders });
 
   const url = new URL(req.url);
