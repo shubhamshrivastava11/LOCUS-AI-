@@ -21,6 +21,7 @@
 
 import { SupabaseClient } from "npm:@supabase/supabase-js@2";
 import { getServiceClient } from "../_shared/supabase.ts";
+import { assertStillAMember } from "../_shared/tenantAuth.ts";
 
 // ── Types ──────────────────────────────────────────────────────────────────────
 
@@ -384,6 +385,11 @@ Deno.serve(async (req: Request) => {
   let ctx: TenantContext;
   try {
     ctx = await verifyTenantJwt(token, appSecret);
+    // MCP verifies the signature with its own implementation, so it does not
+    // inherit the check added to _shared/tenantAuth.ts's getCurrentTenant.
+    // Without this a removed member keeps full MCP access until their 24-hour
+    // token expires - and MCP's only authorization IS tenant scope.
+    await assertStillAMember(ctx.userId, ctx.tenantId);
   } catch (err) {
     console.warn("JWT verification failed:", (err as Error).message);
     return jsonResponse(

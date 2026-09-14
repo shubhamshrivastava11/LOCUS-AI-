@@ -1154,17 +1154,31 @@ async function handleIngestionMessageInner(msg: PgmqMsg): Promise<string> {
     // connection for this tenant+source" was the only signal available.
     // Still re-verified against tenant/status here rather than trusted
     // blindly, in case it was disconnected between enqueue and processing.
-    const connRows = payload.connection_id
-      ? await sql`
+    let fallbackRows: { id: string }[];
+    if (payload.connection_id) {
+      // An envelope that names its connection must match THAT connection or
+      // fail. It used to fall through to "oldest active connection for this
+      // tenant and source" when the named one was gone, which meant
+      // disconnecting Gmail account A while account B stayed active silently
+      // re-filed A's queued mail under B. That is not just wrong
+      // attribution: privacy for personal sources is decided by
+      // source_connections.connected_by, so it also changed who could see
+      // the mail, and it did so specifically when someone had just asked for
+      // the opposite by disconnecting.
+      fallbackRows = await sql`
         SELECT id FROM public.source_connections
         WHERE id = ${payload.connection_id} AND tenant_id = ${tenantId} AND status = 'active'
-      `
-      : [];
-    const fallbackRows = connRows.length > 0 ? connRows : await sql`
-      SELECT id FROM public.source_connections
-      WHERE tenant_id = ${tenantId} AND source = ${payload.source} AND status = 'active'
-      ORDER BY created_at ASC LIMIT 1
-    `;
+      ` as unknown as { id: string }[];
+    } else {
+      // No connection named at all - a legacy envelope from before
+      // connectors attributed their events. Guessing is the only option
+      // here, and it is bounded to the same tenant and source.
+      fallbackRows = await sql`
+        SELECT id FROM public.source_connections
+        WHERE tenant_id = ${tenantId} AND source = ${payload.source} AND status = 'active'
+        ORDER BY created_at ASC LIMIT 1
+      ` as unknown as { id: string }[];
+    }
     if (fallbackRows.length === 0) {
       // Non-retryable: this tenant no longer has an active connection for
       // this source (they disconnected it after this message was already
@@ -1172,7 +1186,10 @@ async function handleIngestionMessageInner(msg: PgmqMsg): Promise<string> {
       // is pure waste - the caller deletes the message instead of leaving
       // it to retry forever.
       throw new NonRetryableIngestionError(
-        `No active source_connections row for tenant=${tenantId} source=${payload.source}`,
+        payload.connection_id
+          ? `Connection ${payload.connection_id} is gone or inactive for tenant=${tenantId} ` +
+            `source=${payload.source}; refusing to re-file its events under another connection`
+          : `No active source_connections row for tenant=${tenantId} source=${payload.source}`,
       );
     }
     const connectionId = fallbackRows[0].id;

@@ -31,11 +31,40 @@ export async function verifyTenantJwt(token: string): Promise<TenantContext> {
   };
 }
 
+/**
+ * Confirms the user is STILL a member of the tenant their token names.
+ *
+ * Tenant JWTs live 24 hours and carry tenant_id as a claim, so until now
+ * removing somebody from a workspace did nothing to the token already in their
+ * browser - team-invites deleted the membership row and they kept working for
+ * up to a day on every route whose only authorization was tenant scope.
+ *
+ * A shorter TTL would have narrowed the window without closing it. This closes
+ * it: one indexed lookup on (user_id, tenant_id), which is cheap next to the
+ * work any of these routes goes on to do.
+ */
+export async function assertStillAMember(userId: string, tenantId: string): Promise<void> {
+  const rows = await withAdmin(async (sql) => {
+    return await sql`
+      SELECT 1 FROM public.memberships
+      WHERE user_id = ${userId}::uuid AND tenant_id = ${tenantId}::uuid
+      LIMIT 1
+    `;
+  });
+  if (rows.length === 0) {
+    throw new Error("No longer a member of this workspace");
+  }
+}
+
 export async function getCurrentTenant(req: Request): Promise<TenantContext> {
   const header = req.headers.get("Authorization") ?? "";
   const match = header.match(/^Bearer\s+(.+)$/i);
   if (!match) throw new Error("Missing Authorization: Bearer token");
-  return await verifyTenantJwt(match[1]);
+  const ctx = await verifyTenantJwt(match[1]);
+  // The signature proves the token was issued to this person for this tenant.
+  // It does not prove they are still in it.
+  await assertStillAMember(ctx.userId, ctx.tenantId);
+  return ctx;
 }
 
 /**
