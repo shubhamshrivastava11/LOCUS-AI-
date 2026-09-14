@@ -1,4 +1,5 @@
 import { withTenant } from "../_shared/db.ts";
+import { encryptedRefreshTokenFields } from "../_shared/refreshToken.ts";
 import { ensureSourceConnectionDisplayNameColumn } from "../_shared/sourceConnectionSchema.ts";
 import {
   authorizeErrorResponse,
@@ -147,7 +148,8 @@ Deno.serve(async (req: Request) => {
               'active',
               ${sql.json({
                 history_id: null,
-                refresh_token: tokenData.refresh_token ?? null,
+                // Encrypted, like the access token beside it always was.
+                ...(await encryptedRefreshTokenFields(tokenData.refresh_token)),
               })}::jsonb,
               ${lastSyncedAt},
               ${userId || null}::uuid

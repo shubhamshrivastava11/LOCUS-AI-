@@ -19,6 +19,7 @@
 // getting the connection established - not built here.
 
 import { withTenant } from "../_shared/db.ts";
+import { encryptedRefreshTokenFields } from "../_shared/refreshToken.ts";
 import { ensureSourceConnectionDisplayNameColumn } from "../_shared/sourceConnectionSchema.ts";
 import {
   authorizeErrorResponse,
@@ -163,7 +164,9 @@ Deno.serve(async (req: Request) => {
               'polling',
               'active',
               ${sql.json({
-                refresh_token: tokenData.refresh_token ?? null,
+                // Encrypted; Atlassian rotates this on every use and it
+                // outlives the access token beside it.
+                ...(await encryptedRefreshTokenFields(tokenData.refresh_token)),
                 cloud_id: site.id,
                 site_url: site.url,
               })},

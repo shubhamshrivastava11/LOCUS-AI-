@@ -13,6 +13,7 @@
 
 import { withTenant } from "./db.ts";
 import { encryptToken } from "./tokenCrypto.ts";
+import { encryptedRefreshTokenFields, readRefreshToken } from "./refreshToken.ts";
 
 const CLIENT_ID = Deno.env.get("ATLASSIAN_CLIENT_ID");
 const CLIENT_SECRET = Deno.env.get("ATLASSIAN_CLIENT_SECRET");
@@ -37,7 +38,9 @@ export interface AtlassianConnection {
 export async function refreshAtlassianAccess(
   connection: AtlassianConnection,
 ): Promise<{ accessToken: string; cloudId: string } | null> {
-  const refreshToken = connection.cursor_state?.refresh_token;
+  // Reads the encrypted copy, converting a legacy plaintext one in place on
+  // the way past - see refreshToken.ts.
+  const refreshToken = await readRefreshToken(connection.id, connection.cursor_state);
   const cloudId = connection.cursor_state?.cloud_id;
   if (!refreshToken || !cloudId) {
     console.error(`Connection ${connection.id} missing refresh_token or cloud_id in cursor_state`);
@@ -72,8 +75,9 @@ export async function refreshAtlassianAccess(
             cursor_state = ${sql.json({
               ...connection.cursor_state,
               // Always the NEW refresh_token - the old one is now dead,
-              // storing it back would break the next refresh cycle.
-              refresh_token: data.refresh_token ?? refreshToken,
+              // storing it back would break the next refresh cycle. Written
+              // encrypted, and this clears any plaintext left on the row.
+              ...(await encryptedRefreshTokenFields(data.refresh_token ?? refreshToken)),
             })}
         WHERE id = ${connection.id}
       `;

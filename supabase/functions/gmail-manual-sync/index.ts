@@ -2,6 +2,7 @@ import { withAdmin, withTenant } from "../_shared/db.ts";
 import { enqueueEvent, IngestionEnvelope } from "../_shared/queue.ts";
 import { htmlToPlainText } from "../_shared/htmlText.ts";
 import { encryptToken } from "../_shared/tokenCrypto.ts";
+import { readRefreshToken } from "../_shared/refreshToken.ts";
 
 console.log("Gmail manual sync started!");
 
@@ -59,9 +60,12 @@ async function markSourceError(source: any): Promise<void> {
 
 // deno-lint-ignore no-explicit-any
 async function refreshAccessToken(source: any): Promise<string | null> {
-  const refreshToken = (source.cursor_state as Record<string, unknown> | null)?.refresh_token as
-    | string
-    | undefined;
+  // Reads the encrypted copy, converting a legacy plaintext one in place on
+  // the way past - see _shared/refreshToken.ts.
+  const refreshToken = await readRefreshToken(
+    source.id as string,
+    source.cursor_state as Record<string, unknown> | null,
+  );
   if (!refreshToken) {
     console.error(`No refresh_token stored for source ${source.id}; cannot refresh.`);
     await markSourceError(source);
