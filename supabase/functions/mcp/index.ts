@@ -21,7 +21,7 @@
 
 import { SupabaseClient } from "npm:@supabase/supabase-js@2";
 import { getServiceClient } from "../_shared/supabase.ts";
-import { assertStillAMember } from "../_shared/tenantAuth.ts";
+import { assertStillAMember, visibleRecordIds } from "../_shared/tenantAuth.ts";
 
 // ── Types ──────────────────────────────────────────────────────────────────────
 
@@ -222,7 +222,8 @@ async function toolSearchDecisions(
       throw new Error("Search failed");
     }
 
-    const decisions = (rows ?? []).filter((r: { tenant_id: string }) => r.tenant_id === ctx.tenantId); // Layer-2
+    const sameTenant = (rows ?? []).filter((r: { tenant_id: string }) => r.tenant_id === ctx.tenantId);
+    const decisions = await dropOthersPersonalRecords(ctx, sameTenant);
     return { decisions, total: decisions.length, tenant_id: ctx.tenantId };
   }
 
@@ -231,8 +232,26 @@ async function toolSearchDecisions(
     throw new Error("Search failed");
   }
 
-  const decisions = (data ?? []).filter((r: { tenant_id: string }) => r.tenant_id === ctx.tenantId); // Layer-2
+  const sameTenant = (data ?? []).filter((r: { tenant_id: string }) => r.tenant_id === ctx.tenantId);
+  const decisions = await dropOthersPersonalRecords(ctx, sameTenant);
   return { decisions, total: decisions.length, tenant_id: ctx.tenantId };
+}
+
+/**
+ * Tenant scope was the ONLY authorization MCP applied, so an agent connected
+ * by one member could read records extracted from another member's personal
+ * Gmail - content the web UI has excluded since the Gmail privacy work.
+ * search_decisions_fts filters on p_tenant_id and nothing else, so the
+ * distinction has to be applied here.
+ */
+async function dropOthersPersonalRecords(
+  ctx: TenantContext,
+  rows: { id?: string }[],
+): Promise<{ id?: string }[]> {
+  const ids = rows.map((r) => String(r.id ?? "")).filter((id) => id.length > 0);
+  if (ids.length === 0) return rows;
+  const allowed = await visibleRecordIds(ctx.tenantId, ctx.userId, ids);
+  return rows.filter((r) => allowed.has(String(r.id ?? "")));
 }
 
 async function toolGetDecisionContext(

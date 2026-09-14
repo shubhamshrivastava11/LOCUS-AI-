@@ -110,6 +110,48 @@ export const PERSONAL_SOURCES = ["gmail"] as const;
  * external_workspace_id IS the address, so returning it would put the scope
  * back by another route.
  */
+/**
+ * Narrows a set of record ids to those the caller may see under the
+ * personal-source rule, dropping any that originate from somebody ELSE's
+ * personal connection.
+ *
+ * Exists because the same predicate was written inline in api/index.ts's
+ * listDecisions and getDecisionById and nowhere else, so every other route
+ * that returns records - MCP, the export - simply did not have it. One
+ * implementation, reusable, is the only way that stops drifting apart again.
+ *
+ * Same carve-out as the original: a connection predating connected_by cannot
+ * be attributed to anyone, so its records stay visible rather than being
+ * hidden from their own owner.
+ */
+export async function visibleRecordIds(
+  tenantId: string,
+  userId: string,
+  recordIds: string[],
+): Promise<Set<string>> {
+  if (recordIds.length === 0) return new Set();
+  const rows = await withAdmin(async (sql) => {
+    return await sql`
+      SELECT d.id
+      FROM public.decisions d
+      WHERE d.tenant_id = ${tenantId}::uuid
+        AND d.id = ANY(${recordIds}::uuid[])
+        AND NOT EXISTS (
+          SELECT 1
+          FROM public.raw_events pre
+          JOIN public.source_connections psc
+            ON psc.id = pre.connection_id AND psc.tenant_id = pre.tenant_id
+          WHERE pre.id = d.origin_raw_event_id
+            AND pre.tenant_id = d.tenant_id
+            AND psc.source = ANY(${[...PERSONAL_SOURCES]}::text[])
+            AND psc.connected_by IS NOT NULL
+            AND psc.connected_by <> ${userId}::uuid
+        )
+    ` as unknown as { id: string }[];
+  });
+  return new Set(rows.map((r) => r.id));
+}
+
 export async function resolvePermissionScopes(
   userId: string, tenantId: string,
   options: { excludePersonalSources?: boolean } = {},
