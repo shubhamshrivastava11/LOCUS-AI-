@@ -113,6 +113,82 @@ async function fetchWithTimeout(url: string, init: RequestInit, timeoutMs: numbe
 
 const CLAUDE_MAX_RETRIES = 3;
 
+// Daily ceiling on what this pipeline may spend with Anthropic. loci-chat has
+// had one of these since it shipped; the main pipeline, where nearly all the
+// spend actually is, had none.
+//
+// Measured 14 Sep 2026 the steady state is about $0.15/day, so this is not a
+// throttle on normal operation - it is a stop on a burst. The worker drains 40
+// messages a minute on a one-minute cron, so a large backfill can put ~57,000
+// events a day through extraction.
+const DAILY_SPEND_CAP_USD = Number(Deno.env.get("AI_DAILY_SPEND_CAP_USD") ?? "1");
+
+// Haiku 4.5, USD per million tokens. Same table loci-chat uses.
+const PRICE_PER_MTOK = { input: 1.0, output: 5.0, cacheWrite: 1.25, cacheRead: 0.1 };
+
+interface ClaudeUsage {
+  input_tokens?: number;
+  output_tokens?: number;
+  cache_creation_input_tokens?: number;
+  cache_read_input_tokens?: number;
+}
+
+function estimateCostUsd(u: ClaudeUsage): number {
+  return (
+    ((u.input_tokens ?? 0) * PRICE_PER_MTOK.input +
+      (u.output_tokens ?? 0) * PRICE_PER_MTOK.output +
+      (u.cache_creation_input_tokens ?? 0) * PRICE_PER_MTOK.cacheWrite +
+      (u.cache_read_input_tokens ?? 0) * PRICE_PER_MTOK.cacheRead) / 1_000_000
+  );
+}
+
+/** What this pipeline has spent with Anthropic so far today. */
+async function todaysSpendUsd(): Promise<number> {
+  try {
+    const rows = await withAdmin(async (sql) => {
+      return await sql`
+        SELECT input_tokens, output_tokens, cache_creation_input_tokens, cache_read_input_tokens
+        FROM public.pipeline_daily_usage WHERE usage_date = CURRENT_DATE
+      ` as unknown as ClaudeUsage[];
+    });
+    return rows.length === 0 ? 0 : estimateCostUsd(rows[0]);
+  } catch (err) {
+    // Fail OPEN, unlike the privacy settings. An accounting table that cannot
+    // be read is a reason to keep working and shout, not to halt ingestion -
+    // the cap protects a bill, and the bill is small enough that a few minutes
+    // of unmetered work cannot hurt. Getting this backwards would mean one bad
+    // query stopping the product.
+    console.error("Cannot read pipeline_daily_usage, proceeding uncapped:", err);
+    return 0;
+  }
+}
+
+/** Adds one call's usage to today's running total. Never throws. */
+async function recordUsage(usage: ClaudeUsage): Promise<void> {
+  try {
+    await withAdmin(async (sql) => {
+      await sql`
+        INSERT INTO public.pipeline_daily_usage AS u (
+          usage_date, input_tokens, output_tokens,
+          cache_creation_input_tokens, cache_read_input_tokens, request_count
+        )
+        VALUES (
+          CURRENT_DATE, ${usage.input_tokens ?? 0}, ${usage.output_tokens ?? 0},
+          ${usage.cache_creation_input_tokens ?? 0}, ${usage.cache_read_input_tokens ?? 0}, 1
+        )
+        ON CONFLICT (usage_date) DO UPDATE SET
+          input_tokens = u.input_tokens + EXCLUDED.input_tokens,
+          output_tokens = u.output_tokens + EXCLUDED.output_tokens,
+          cache_creation_input_tokens = u.cache_creation_input_tokens + EXCLUDED.cache_creation_input_tokens,
+          cache_read_input_tokens = u.cache_read_input_tokens + EXCLUDED.cache_read_input_tokens,
+          request_count = u.request_count + 1
+      `;
+    });
+  } catch (err) {
+    console.error("Could not record pipeline usage (call already happened):", err);
+  }
+}
+
 // cacheable=true marks the system prompt with cache_control so Anthropic
 // reuses it across invocations instead of re-billing the full static
 // instructions every single call - this is the biggest win for a pipeline
@@ -179,6 +255,12 @@ async function callClaude(
         cache_creation_input_tokens: usage.cache_creation_input_tokens ?? 0,
         cache_read_input_tokens: usage.cache_read_input_tokens ?? 0,
       }));
+      // The usage above was already being logged and thrown away. Persisting
+      // it is what makes the daily cap possible at all. Awaited rather than
+      // fire-and-forget: an un-awaited write can be cut off when the isolate
+      // is torn down, which would undercount exactly when volume is highest.
+      await recordUsage(usage as ClaudeUsage);
+
       const block = (data.content ?? []).find((b: { type?: string }) => b.type === "tool_use");
       if (!block) throw new Error(`Claude did not return a tool_use block for ${toolName}`);
       return block.input as Record<string, unknown>;
@@ -1638,6 +1720,27 @@ async function runBounded<T>(items: T[], concurrency: number, fn: (item: T) => P
 
 Deno.serve(async (req: Request) => {
   if (req.method === "OPTIONS") return new Response("ok", { headers: corsHeaders });
+
+  // Checked before reading either queue, deliberately. Stopping here leaves
+  // every message untouched with its read_ct unchanged, so nothing ages toward
+  // the dead-letter threshold while the pipeline is paused for budget - the
+  // work resumes tomorrow exactly where it stopped. Bailing out mid-batch
+  // instead would quietly convert a spending pause into data loss.
+  const spentToday = await todaysSpendUsd();
+  if (spentToday >= DAILY_SPEND_CAP_USD) {
+    console.warn(
+      `Daily spend cap reached: $${spentToday.toFixed(4)} of $${DAILY_SPEND_CAP_USD} - ` +
+        `skipping this run. Queues are untouched and resume after midnight UTC.`,
+    );
+    return new Response(
+      JSON.stringify({
+        skipped: "daily_spend_cap_reached",
+        spent_usd: Number(spentToday.toFixed(4)),
+        cap_usd: DAILY_SPEND_CAP_USD,
+      }),
+      { status: 200, headers: { ...corsHeaders, "Content-Type": "application/json" } },
+    );
+  }
 
   // pgmq.read() sets each row's visibility timeout as a side effect of the
   // SQL call itself - if anything after that point throws (a parsing bug,
