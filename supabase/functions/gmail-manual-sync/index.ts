@@ -187,7 +187,7 @@ async function listGmailMessagesPage(
   query: string,
   pageToken: string | undefined,
   maxResults: number,
-): Promise<{ ids: { id: string }[]; nextPageToken?: string }> {
+): Promise<{ ids: { id: string }[]; nextPageToken?: string; failed?: boolean }> {
   const url = new URL("https://gmail.googleapis.com/gmail/v1/users/me/messages");
   url.searchParams.set("maxResults", String(Math.min(LIST_PAGE_SIZE, Math.max(maxResults, 0))));
   if (query) url.searchParams.set("q", query);
@@ -200,7 +200,12 @@ async function listGmailMessagesPage(
   );
   if (!resp.ok) {
     console.error(`Gmail list page failed (query=${query}):`, await resp.text());
-    return { ids: [] };
+    // `failed` exists because an empty ids array is exactly what a COMPLETED
+    // backfill looks like. Returning one on an HTTP error told the caller the
+    // 30-day window had been fully read, so it cleared backfill_page_token and
+    // stamped last_synced_at - permanently skipping every message from the
+    // failed page onward. One 503 was enough to lose a mailbox's history.
+    return { ids: [], failed: true };
   }
   const data = await resp.json();
   return { ids: data.messages ?? [], nextPageToken: data.nextPageToken };
@@ -307,6 +312,9 @@ Deno.serve(async (_req) => {
       let messages: { id: string }[];
       let query: string;
       let nextBackfillPageToken: string | undefined;
+      // Set when a backfill list page returned an HTTP error, which is
+      // otherwise indistinguishable from reaching the end of the window.
+      let backfillPageFailed = false;
 
       if (backfilling) {
         // Fixed window anchored to when this connection was actually made,
@@ -328,6 +336,7 @@ Deno.serve(async (_req) => {
         );
         messages = page.ids;
         nextBackfillPageToken = page.nextPageToken;
+        backfillPageFailed = page.failed === true;
       } else {
         query = `after:${formatGmailAfterDate(new Date(source.last_synced_at))}`;
         messages = await listGmailMessageIds(accessToken, query, INCREMENTAL_MAX_MESSAGES);
@@ -442,7 +451,17 @@ Deno.serve(async (_req) => {
         syncedCount++;
       }
 
-      if (backfilling) {
+      if (backfilling && backfillPageFailed) {
+        // Listing failed part-way. Whatever was fetched before the failure has
+        // already been enqueued, and the resume token is left exactly as it
+        // was, so the next run re-reads from the last known-good point.
+        // Deliberately does NOT stamp last_synced_at: doing so would declare a
+        // backfill complete that demonstrably is not.
+        console.error(
+          `Gmail backfill page failed for ${source.id}; leaving the resume point untouched ` +
+            `so the next run retries it rather than skipping past it.`,
+        );
+      } else if (backfilling) {
         if (nextBackfillPageToken) {
           // More messages remain within the 30-day window - stay in
           // backfill mode, save the resume point for the next cron run.
