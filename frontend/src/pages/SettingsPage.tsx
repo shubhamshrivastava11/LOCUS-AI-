@@ -598,6 +598,7 @@ function TeamSettings() {
   const [copied, setCopied] = useState(false)
 
   const [removeTarget, setRemoveTarget] = useState<TeamMember | null>(null)
+  const [roleError, setRoleError] = useState('')
   const [isRemoving, setIsRemoving] = useState(false)
   const [removeError, setRemoveError] = useState('')
 
@@ -734,6 +735,33 @@ function TeamSettings() {
     setIsRemoving(false)
   }
 
+  /**
+   * Change one member's role in place.
+   *
+   * Optimistic, then reconciled from the server, because the server applies
+   * rules the list cannot see on its own - the last owner cannot be demoted,
+   * a promotion out of guest has to clear the expiry - and the honest outcome
+   * is whatever comes back from it rather than what was clicked.
+   */
+  const handleRoleChange = async (member: TeamMember, nextRole: string) => {
+    if (nextRole === member.role) return
+    const previous = members
+    setMembers((current) =>
+      current.map((m) => (m.membership_id === member.membership_id ? { ...m, role: nextRole, role_level: ROLE_LEVELS[nextRole] } : m)),
+    )
+    setRoleError('')
+
+    const result = await invokeTeamInvites({
+      action: 'set_role', membership_id: member.membership_id, role: nextRole,
+    })
+    if (result.error) {
+      setMembers(previous)
+      setRoleError(result.error)
+      return
+    }
+    await loadTeam().catch(() => undefined)
+  }
+
   const handleLeaveTeam = async () => {
     setIsLeaving(true)
     setLeaveError('')
@@ -830,6 +858,16 @@ function TeamSettings() {
         ) : null}
       </div>
 
+      {/* A refused role change is a rule being explained, not a failure - the
+          last owner cannot be demoted, and you cannot promote someone past
+          yourself. Shown above the list because that is where the change was
+          attempted. */}
+      {roleError ? (
+        <p role="alert" className="mt-4 rounded-xl border border-[#F4C7C7] bg-[#FEF2F2] px-4 py-2.5 text-[13px] text-[#B4232C]">
+          {roleError}
+        </p>
+      ) : null}
+
       <div className="mt-8 overflow-hidden rounded-2xl border border-[#E8E8ED] bg-white shadow-[0_1px_2px_rgba(16,24,40,0.04)]">
         {isLoading ? (
           <p className="px-5 py-12 text-center text-[14px] text-[#6B7280]">Loading team...</p>
@@ -870,6 +908,30 @@ function TeamSettings() {
                     remove a co-Owner - the server still refuses to remove the
                     last one - where before nobody could remove an Owner at
                     all and a co-Owner was effectively permanent. */}
+                {canManage && !member.is_self &&
+                    levelOf(members.find((m) => m.is_self)) > levelOf(member) ? (
+                  <select
+                    value={member.role}
+                    aria-label={`Role for ${member.display_name ?? member.email ?? 'this member'}`}
+                    onChange={(event) => void handleRoleChange(member, event.target.value)}
+                    className="rounded-lg border border-[#DEE1E8] bg-white px-2 py-1.5 text-[13px] font-medium text-[#374151] outline-none focus:border-[#5A45FF]"
+                  >
+                    {/* Only what this caller may actually assign. Offering a
+                        level the server will refuse turns a rule into an
+                        error message. */}
+                    {(['guest', 'member', 'lead', 'admin', 'owner'] as const)
+                      .filter((r) =>
+                        r === member.role ||
+                        (r === 'owner'
+                          ? levelOf(members.find((m) => m.is_self)) >= ROLE_LEVELS.owner
+                          : levelOf(members.find((m) => m.is_self)) > ROLE_LEVELS[r]))
+                      .map((r) => (
+                        <option key={r} value={r}>
+                          {r.charAt(0).toUpperCase() + r.slice(1)}
+                        </option>
+                      ))}
+                  </select>
+                ) : null}
                 {canManage && !member.is_self &&
                     levelOf(members.find((m) => m.is_self)) > levelOf(member) ? (
                   <button
