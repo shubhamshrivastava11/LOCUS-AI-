@@ -241,7 +241,7 @@ Deno.serve(async (req: Request) => {
 
   const { data: membership } = await supabase
     .from("memberships")
-    .select("tenant_id, role")
+    .select("tenant_id, role, can_manage_connectors")
     .eq("user_id", user.id)
     .limit(1)
     .maybeSingle();
@@ -251,6 +251,21 @@ Deno.serve(async (req: Request) => {
   }
   const tenantId = membership.tenant_id as string;
   const callerRole = membership.role as string;
+  /**
+   * Who may act on a connection somebody else set up.
+   *
+   * Was written as `callerRole === "member"`, which was an exhaustive test
+   * back when the only roles were owner, admin and member. It stopped being
+   * one the moment Lead and Guest existed - a Guest is not "member", so the
+   * old form would have handed a contractor the right to disconnect the
+   * team's Slack.
+   *
+   * Stated positively instead, and including the capability flag, which is
+   * the whole reason that flag exists: the person who wires up connectors
+   * does not need to be promoted into reading everyone's decisions.
+   */
+  const canManageConnections = ["owner", "admin"].includes(callerRole) ||
+    membership.can_manage_connectors === true;
 
   let body: Record<string, unknown>;
   try {
@@ -441,10 +456,10 @@ Deno.serve(async (req: Request) => {
     if (
       target.connected_by &&
       target.connected_by !== user.id &&
-      callerRole === "member"
+      !canManageConnections
     ) {
       return jsonResponse({
-        error: "Only the person who connected this, or a workspace owner/admin, can disconnect it",
+        error: "Only the person who connected this, or someone who manages connectors, can disconnect it",
       }, 403);
     }
 

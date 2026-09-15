@@ -49,6 +49,23 @@ jobs:
       - name: Tests
         run: deno test --node-modules-dir=none --allow-all supabase/functions/_shared/
 
+      # loci-chat is the marketing-site widget. It is unauthenticated, rate
+      # limited, and answers from canned product facts held in its own loci_*
+      # tables. No tenant data has ever reached it and the whole design depends
+      # on that staying true, so it is asserted rather than remembered - the
+      # same reasoning as the frontend's import-escape guard in deploy.yml.
+      #
+      # `decisions` and `raw_events` are the content tables; withTenant is the
+      # only way to read them under a tenant. A legitimate need would mean the
+      # widget had stopped being a marketing widget.
+      - name: loci-chat reaches no tenant data
+        run: |
+          if grep -nE "withTenant|\bpublic\.decisions\b|\bpublic\.raw_events\b|from\(\"decisions\"\)" supabase/functions/loci-chat/index.ts; then
+            echo "::error::loci-chat must never query tenant content."
+            exit 1
+          fi
+          echo "loci-chat touches no tenant content."
+
   frontend:
     name: Frontend
     runs-on: ubuntu-latest

@@ -102,8 +102,53 @@ async function getAuthedUser(supabase: ServiceClient, req: Request): Promise<Aut
 }
 
 // Loads the caller's own membership + role for their (oldest, same
+// ── The role ladder ──────────────────────────────────────────────────────
+//
+// Mirrors memberships.role_level, which is a generated column over the same
+// names. Duplicated here rather than read back per request because it is used
+// for comparisons on every management action and the mapping is fixed by a
+// CHECK constraint on the same table.
+const ROLE_LEVELS: Record<string, number> = {
+  owner: 5,
+  admin: 4,
+  lead: 3,
+  member: 2,
+  guest: 1,
+};
+
+/** Roles that can be handed out by invitation. Owner is transferred, not invited. */
+const INVITABLE_ROLES = ["admin", "lead", "member", "guest"];
+
+function levelOf(role: string | null | undefined): number {
+  return ROLE_LEVELS[String(role ?? "")] ?? 0;
+}
+
+/** Default Guest window when an inviter does not name one. */
+const GUEST_DEFAULT_DAYS = 30;
+
+/**
+ * Who may hand out, or take away, a given role.
+ *
+ * Two rules, and the second is the one worth stating: you cannot grant a role
+ * at or above your own. Without it an Admin could promote a colleague to Owner
+ * and inherit the billing surface through them, which makes the level below
+ * Owner equivalent to Owner.
+ *
+ * The first rule is the Owner carve-out: only an Owner may create or remove
+ * another Owner. An Admin manages the workspace; it does not get to decide who
+ * owns it.
+ */
+function canAssign(callerRole: string, targetRole: string): boolean {
+  const caller = levelOf(callerRole);
+  const target = levelOf(targetRole);
+  if (target >= ROLE_LEVELS.owner) return caller >= ROLE_LEVELS.owner;
+  return caller > target;
+}
+
 // resolution /auth/session uses) tenant, doubling as the owner/admin gate.
-async function requireOwnerOrAdmin(supabase: ServiceClient, userId: string): Promise<AuthError | { tenantId: string }> {
+async function requireOwnerOrAdmin(
+  supabase: ServiceClient, userId: string,
+): Promise<AuthError | { tenantId: string; role: string }> {
   const { data: memberships, error } = await supabase
     .from("memberships").select("tenant_id, role, created_at").eq("user_id", userId);
   if (error) {
@@ -113,10 +158,13 @@ async function requireOwnerOrAdmin(supabase: ServiceClient, userId: string): Pro
   const primary = (memberships ?? []).sort((a: { created_at?: string }, b: { created_at?: string }) =>
     String(a.created_at ?? "").localeCompare(String(b.created_at ?? "")))[0];
   if (!primary) return { error: "No workspace found for this account", status: 404 };
-  if (primary.role !== "owner" && primary.role !== "admin") {
-    return { error: "Only workspace owners and admins can manage invites", status: 403 };
+  // Leads invite into the scopes they own, so they reach this gate too. What
+  // they may hand out is then narrowed by canAssign, which stops a Lead
+  // creating an Admin.
+  if (!["owner", "admin", "lead"].includes(String(primary.role))) {
+    return { error: "Only workspace owners, admins and leads can manage invites", status: 403 };
   }
-  return { tenantId: primary.tenant_id as string };
+  return { tenantId: primary.tenant_id as string, role: String(primary.role) };
 }
 
 Deno.serve(async (req: Request) => {
@@ -206,8 +254,26 @@ Deno.serve(async (req: Request) => {
       if ("error" in caller) return jsonResponse({ error: caller.error }, caller.status);
 
       const email = String(body.email ?? "").trim().toLowerCase();
-      const role = body.role === "admin" ? "admin" : "member";
+      const requestedRole = String(body.role ?? "member");
+      const role = INVITABLE_ROLES.includes(requestedRole) ? requestedRole : "member";
       if (!email || !email.includes("@")) return jsonResponse({ error: "A valid email is required" }, 422);
+      if (!canAssign(caller.role, role)) {
+        return jsonResponse({ error: `You can't invite someone as ${role}` }, 403);
+      }
+
+      // Guests are time-limited by definition - that is what separates a Guest
+      // from a Member with a narrow scope list. An inviter who names no window
+      // gets the default rather than a membership that never ends, because a
+      // contractor whose access quietly outlives the contract is the exact
+      // failure the role exists to prevent.
+      let membershipExpiresAt: string | null = null;
+      if (role === "guest") {
+        const requested = body.expires_at ? new Date(String(body.expires_at)) : null;
+        const valid = requested && !Number.isNaN(requested.getTime()) && requested.getTime() > Date.now();
+        membershipExpiresAt = (valid
+          ? requested
+          : new Date(Date.now() + GUEST_DEFAULT_DAYS * 86_400_000)).toISOString();
+      }
 
       const { data: tenant } = await supabase.from("tenants").select("name, plan").eq("id", caller.tenantId).maybeSingle();
       // Real, enforced distinction (not just onboarding copy): an
@@ -223,6 +289,7 @@ Deno.serve(async (req: Request) => {
       const inviteToken = randomToken();
       const { error: insertError } = await supabase.from("invites").insert({
         tenant_id: caller.tenantId, email, role, invited_by: authed.user.id, token: inviteToken,
+        membership_expires_at: membershipExpiresAt,
       });
       if (insertError) {
         // Partial unique index (tenant_id, lower(email)) where pending -
@@ -268,6 +335,9 @@ Deno.serve(async (req: Request) => {
 
       const { error: membershipError } = await supabase.from("memberships").insert({
         tenant_id: invite.tenant_id, user_id: authed.user.id, role: invite.role,
+        // Only ever set for a Guest - a CHECK on memberships enforces that,
+        // so sending it for any other role would be rejected outright.
+        expires_at: invite.role === "guest" ? invite.membership_expires_at : null,
       });
       if (membershipError) {
         console.error("Unable to create membership:", membershipError);
@@ -348,7 +418,9 @@ Deno.serve(async (req: Request) => {
       if (!tenantId) return jsonResponse({ error: "No workspace found for this account" }, 404);
 
       const [{ data: rows, error }, { data: tenant }] = await Promise.all([
-        supabase.from("memberships").select("id, user_id, role, created_at").eq("tenant_id", tenantId).order("created_at", { ascending: true }),
+        supabase.from("memberships")
+          .select("id, user_id, role, role_level, can_manage_connectors, can_view_audit, expires_at, created_at")
+          .eq("tenant_id", tenantId).order("created_at", { ascending: true }),
         supabase.from("tenants").select("name, plan").eq("id", tenantId).maybeSingle(),
       ]);
       if (error) {
@@ -356,7 +428,11 @@ Deno.serve(async (req: Request) => {
         return jsonResponse({ error: "Unable to load team members" }, 500);
       }
 
-      const members = await Promise.all((rows ?? []).map(async (m: { id: string; user_id: string; role: string; created_at: string }) => {
+      const members = await Promise.all((rows ?? []).map(async (m: {
+        id: string; user_id: string; role: string; role_level: number;
+        can_manage_connectors: boolean; can_view_audit: boolean;
+        expires_at: string | null; created_at: string;
+      }) => {
         const { data: authUser } = await supabase.auth.admin.getUserById(m.user_id);
         return {
           membership_id: m.id,
@@ -364,6 +440,14 @@ Deno.serve(async (req: Request) => {
           email: authUser?.user?.email ?? null,
           display_name: authUser?.user?.user_metadata?.full_name ?? null,
           role: m.role,
+          role_level: m.role_level,
+          can_manage_connectors: m.can_manage_connectors === true,
+          can_view_audit: m.can_view_audit === true,
+          expires_at: m.expires_at,
+          // A Guest past their window still has a row; it is the access rule
+          // that drops them to Public-only. Surfaced so the list says
+          // "expired" rather than showing them as an ordinary member.
+          expired: m.expires_at ? new Date(m.expires_at).getTime() <= Date.now() : false,
           joined_at: m.created_at,
           is_self: m.user_id === authed.user.id,
         };
@@ -384,7 +468,24 @@ Deno.serve(async (req: Request) => {
       const { data: target } = await supabase.from("memberships").select("user_id, role").eq("id", membershipId).eq("tenant_id", caller.tenantId).maybeSingle();
       if (!target) return jsonResponse({ error: "Member not found" }, 404);
       if (target.user_id === authed.user.id) return jsonResponse({ error: "Use account settings to remove yourself" }, 400);
-      if (target.role === "owner") return jsonResponse({ error: "Transfer ownership before removing the owner" }, 409);
+      // The ladder, not a blanket ban on removing Owners. An Owner may remove
+      // a co-Owner; an Admin may not, and may not remove another Admin either,
+      // because a peer removing a peer means whoever clicks first wins.
+      if (!canAssign(caller.role, String(target.role))) {
+        return jsonResponse({
+          error: target.role === "owner"
+            ? "Only an owner can remove another owner"
+            : `You can't remove a ${target.role}`,
+        }, 403);
+      }
+      if (target.role === "owner") {
+        const { count } = await supabase
+          .from("memberships").select("id", { count: "exact", head: true })
+          .eq("tenant_id", caller.tenantId).eq("role", "owner");
+        if ((count ?? 0) <= 1) {
+          return jsonResponse({ error: "Transfer ownership before removing the last owner" }, 409);
+        }
+      }
 
       const { error } = await supabase.from("memberships").delete().eq("id", membershipId).eq("tenant_id", caller.tenantId);
       if (error) {
@@ -392,6 +493,105 @@ Deno.serve(async (req: Request) => {
         return jsonResponse({ error: "Unable to remove member" }, 500);
       }
       return jsonResponse({ removed: true }, 200);
+    }
+
+    // ── set_role - change a member's level, or a capability flag ────────
+    //
+    // Without this the hierarchy would be write-once at invite time, which
+    // makes it useless: people change jobs, contractors finish, and the
+    // interesting case is the person who has been a Member for a year and
+    // should now be the Lead of their own channel.
+    //
+    // Everything here goes through canAssign in both directions - you must
+    // out-rank what someone currently is AND what you are making them. That
+    // second half is what stops an Admin promoting a colleague to Owner and
+    // reaching billing through them.
+    if (action === "set_role") {
+      const authed = await getAuthedUser(supabase, req);
+      if ("error" in authed) return jsonResponse({ error: authed.error }, authed.status);
+      const caller = await requireOwnerOrAdmin(supabase, authed.user.id);
+      if ("error" in caller) return jsonResponse({ error: caller.error }, caller.status);
+
+      const membershipId = String(body.membership_id ?? "");
+      if (!membershipId) return jsonResponse({ error: "Missing membership_id" }, 422);
+
+      const { data: target } = await supabase
+        .from("memberships").select("user_id, role")
+        .eq("id", membershipId).eq("tenant_id", caller.tenantId).maybeSingle();
+      if (!target) return jsonResponse({ error: "Member not found" }, 404);
+
+      // Changing your own role is how someone promotes themselves. An Owner
+      // hands ownership over deliberately through transfer, not by editing
+      // their own row.
+      if (target.user_id === authed.user.id) {
+        return jsonResponse({ error: "You can't change your own role" }, 400);
+      }
+      if (!canAssign(caller.role, String(target.role))) {
+        return jsonResponse({ error: `You can't manage a ${target.role}` }, 403);
+      }
+
+      const update: Record<string, unknown> = {};
+
+      if (body.role !== undefined) {
+        const nextRole = String(body.role);
+        if (!(nextRole in ROLE_LEVELS)) return jsonResponse({ error: "Unknown role" }, 422);
+        if (!canAssign(caller.role, nextRole)) {
+          return jsonResponse({ error: `You can't make someone ${nextRole}` }, 403);
+        }
+        update.role = nextRole;
+        // The CHECK on memberships allows expires_at only for a Guest, so
+        // promoting out of Guest has to clear it in the same statement or the
+        // update is rejected. Demoting TO Guest without a window would leave a
+        // guest who never expires, which the role is specifically meant to
+        // prevent, so it gets the default.
+        if (nextRole !== "guest") {
+          update.expires_at = null;
+        } else if (body.expires_at === undefined) {
+          update.expires_at = new Date(Date.now() + GUEST_DEFAULT_DAYS * 86_400_000).toISOString();
+        }
+      }
+
+      // Capability flags are independent of level by design - that is the
+      // whole point of having them rather than promoting someone. Only an
+      // Owner or Admin hands them out; a Lead manages people, not policy.
+      for (const flag of ["can_manage_connectors", "can_view_audit"]) {
+        if (body[flag] === undefined) continue;
+        if (levelOf(caller.role) < ROLE_LEVELS.admin) {
+          return jsonResponse({ error: "Only owners and admins can change capabilities" }, 403);
+        }
+        update[flag] = body[flag] === true;
+      }
+
+      if (body.expires_at !== undefined) {
+        const role = String(update.role ?? target.role);
+        if (role !== "guest") {
+          return jsonResponse({ error: "Only guests have an expiry date" }, 422);
+        }
+        const when = new Date(String(body.expires_at));
+        if (Number.isNaN(when.getTime())) return jsonResponse({ error: "Invalid expiry date" }, 422);
+        update.expires_at = when.toISOString();
+      }
+
+      if (Object.keys(update).length === 0) return jsonResponse({ error: "Nothing to change" }, 422);
+
+      // Never leave a workspace with no owner. Checked before the write rather
+      // than repaired after it, because there is no repair.
+      if (update.role !== undefined && target.role === "owner" && update.role !== "owner") {
+        const { count } = await supabase
+          .from("memberships").select("id", { count: "exact", head: true })
+          .eq("tenant_id", caller.tenantId).eq("role", "owner");
+        if ((count ?? 0) <= 1) {
+          return jsonResponse({ error: "A workspace must always have an owner" }, 409);
+        }
+      }
+
+      const { error } = await supabase
+        .from("memberships").update(update).eq("id", membershipId).eq("tenant_id", caller.tenantId);
+      if (error) {
+        console.error("Unable to update member role:", error);
+        return jsonResponse({ error: "Unable to update this member" }, 500);
+      }
+      return jsonResponse({ updated: true }, 200);
     }
 
     // ── leave_team - any member leaves their own workspace ──────────────

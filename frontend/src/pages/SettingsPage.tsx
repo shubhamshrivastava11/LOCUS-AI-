@@ -533,12 +533,34 @@ function connectionLabel(row: SourceConnectionRow): string | null {
   return row.display_name ?? row.external_workspace_id ?? null
 }
 
+/**
+ * Roles are ordered, and the order is what the UI has to test against.
+ *
+ * Checks here used to read `role !== 'member'`, which was an exhaustive test
+ * of "is this person privileged" when member was the only unprivileged role.
+ * With Guest added it silently stopped being one - a contractor is not
+ * 'member', so they would have been shown the whole management surface. Level
+ * comparisons do not rot that way when a role is added.
+ */
+const ROLE_LEVELS: Record<string, number> = { owner: 5, admin: 4, lead: 3, member: 2, guest: 1 }
+const LEVEL_MEMBER = 2
+
+function levelOf(member: TeamMember | undefined): number {
+  if (!member) return 0
+  return member.role_level ?? ROLE_LEVELS[member.role] ?? 0
+}
+
 type TeamMember = {
   membership_id: string
   user_id: string
   email: string | null
   display_name: string | null
   role: string
+  role_level?: number
+  can_manage_connectors?: boolean
+  can_view_audit?: boolean
+  expires_at?: string | null
+  expired?: boolean
   joined_at: string
   is_self: boolean
 }
@@ -569,7 +591,7 @@ function TeamSettings() {
 
   const [isInviteOpen, setIsInviteOpen] = useState(false)
   const [inviteEmail, setInviteEmail] = useState('')
-  const [inviteRole, setInviteRole] = useState<'member' | 'admin'>('member')
+  const [inviteRole, setInviteRole] = useState<'guest' | 'member' | 'lead' | 'admin'>('member')
   const [isInviting, setIsInviting] = useState(false)
   const [inviteError, setInviteError] = useState('')
   const [inviteResult, setInviteResult] = useState<{ url: string; emailSent: boolean } | null>(null)
@@ -625,7 +647,7 @@ function TeamSettings() {
     }
   }, [])
 
-  const canManage = members.find((m) => m.is_self)?.role !== 'member'
+  const canManage = levelOf(members.find((m) => m.is_self)) > LEVEL_MEMBER
   const canInvite = canManage && workspacePlan === 'team'
 
   const openEditName = () => {
@@ -832,7 +854,24 @@ function TeamSettings() {
                 <span className="rounded-full bg-[#F3F4F6] px-2.5 py-1 text-[12px] font-medium capitalize text-[#4B5563]">
                   {member.role}
                 </span>
-                {canManage && !member.is_self && member.role !== 'owner' ? (
+                {/* A guest past their window keeps their row but sees nothing
+                    above Public, so the list has to say so rather than showing
+                    them as an ordinary member. */}
+                {member.expired ? (
+                  <span className="rounded-full bg-[#FEF2F2] px-2.5 py-1 text-[12px] font-medium text-[#B4232C]">
+                    Expired
+                  </span>
+                ) : member.expires_at ? (
+                  <span className="rounded-full bg-[#FFF7ED] px-2.5 py-1 text-[12px] font-medium text-[#9A5B08]">
+                    Until {new Date(member.expires_at).toLocaleDateString()}
+                  </span>
+                ) : null}
+                {/* You may only act on someone below you. An Owner can now
+                    remove a co-Owner - the server still refuses to remove the
+                    last one - where before nobody could remove an Owner at
+                    all and a co-Owner was effectively permanent. */}
+                {canManage && !member.is_self &&
+                    levelOf(members.find((m) => m.is_self)) > levelOf(member) ? (
                   <button
                     type="button"
                     onClick={() => {
@@ -963,12 +1002,28 @@ function TeamSettings() {
                   Role
                   <select
                     value={inviteRole}
-                    onChange={(event) => setInviteRole(event.target.value === 'admin' ? 'admin' : 'member')}
+                    onChange={(event) =>
+                      setInviteRole(event.target.value as 'guest' | 'member' | 'lead' | 'admin')}
                     className="mt-1.5 w-full rounded-lg border border-[#DEE1E8] px-3 py-2 text-[14px] text-[#111827] outline-none focus:border-[#5A45FF]"
                   >
-                    <option value="member">Member</option>
-                    <option value="admin">Admin</option>
+                    {/* Ordered least to most, so the safe choice reads first
+                        and Admin is a deliberate scroll rather than the
+                        neighbour of the default. Owner is absent on purpose:
+                        ownership is transferred, never sent in a link. */}
+                    <option value="guest">Guest &middot; read-only, expires</option>
+                    <option value="member">Member &middot; search and read</option>
+                    <option value="lead">Lead &middot; owns scopes, team digest</option>
+                    <option value="admin">Admin &middot; members and connectors</option>
                   </select>
+                  <p className="mt-1.5 text-[12px] leading-4 text-[#9CA3AF]">
+                    {inviteRole === 'guest'
+                      ? 'Sees only public records in the scopes you grant, and loses access after 30 days.'
+                      : inviteRole === 'member'
+                      ? 'Sees ordinary records in the channels and pages they belong to.'
+                      : inviteRole === 'lead'
+                      ? 'Everything a member sees, plus sensitive records in their own scopes.'
+                      : 'Manages people, connectors and policy. Sensitive records in their own scopes only.'}
+                  </p>
                 </label>
 
                 {inviteError ? (
@@ -1165,7 +1220,7 @@ function ConnectedSourcesSettings() {
         map[m.user_id] = { name: m.display_name ?? m.email ?? 'a teammate', isSelf: m.is_self }
       }
       setMemberMap(map)
-      setCanManageAll(members.find((m) => m.is_self)?.role !== 'member')
+      setCanManageAll(levelOf(members.find((m) => m.is_self)) > LEVEL_MEMBER)
     })
 
   useEffect(() => {

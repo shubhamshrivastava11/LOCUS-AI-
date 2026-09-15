@@ -31,6 +31,14 @@ import { enforceUserPromptLimit, PromptLimitExceededError } from "../_shared/use
 import { enforceRouteRateLimit, RouteRateLimitExceededError } from "../_shared/routeRateLimit.ts";
 import * as jose from "npm:jose@5";
 import { getCurrentTenant, PERSONAL_SOURCES, resolvePermissionScopes, type TenantContext } from "../_shared/tenantAuth.ts";
+import {
+  type CallerAuthz,
+  CLASSIFICATION_NAMES,
+  filterVisibleRecords,
+  floorAuthz,
+  isRecordVisible,
+  loadCallerAuthz,
+} from "../_shared/permissions.ts";
 import { Trace } from "../_shared/trace.ts";
 import { parseAsOf } from "../_shared/temporal.ts";
 
@@ -655,6 +663,8 @@ function buildDecisionOut(row: any, actors: unknown[], sourceLinks: string[], so
 async function listDecisions(
   tenantId: string,
   userId: string,
+  callerScopes: string[],
+  authz: CallerAuthz,
   limit: number,
   offset: number,
   recordType?: string | null,
@@ -695,6 +705,12 @@ async function listDecisions(
     // Filtering happens here, not client-side, so "Gmail only" (etc.) reflects
     // the full archive across all pages, not just whatever page was loaded
     // before the filter was picked.
+    // Scope and clearance. This path had NEITHER: it applied the
+    // personal-source rule and tenant id and nothing else, so a decision
+    // extracted from a private Slack channel was listed in Memory Explorer
+    // for every member of the tenant regardless of whether they were in the
+    // channel - the exact check /search has run for months.
+    const visibility = visibilitySql(sql, callerScopes, authz);
     const recordTypeFilter = recordType ? sql`AND d.record_type = ${recordType}` : sql``;
     const sourceFilter = source ? sql`AND re.source = ${source}` : sql``;
 
@@ -711,14 +727,14 @@ async function listDecisions(
              d.valid_from, d.valid_until
       FROM decisions d
       LEFT JOIN raw_events re ON re.id = d.origin_raw_event_id AND re.tenant_id = d.tenant_id
-      WHERE d.tenant_id = ${tenantId} ${temporalFilter} ${recordTypeFilter} ${sourceFilter} ${personalFilter}
+      WHERE d.tenant_id = ${tenantId} ${temporalFilter} ${recordTypeFilter} ${sourceFilter} ${personalFilter} ${visibility}
       ORDER BY d.created_at DESC LIMIT ${limit} OFFSET ${offset}
     `;
     const totalRows = await sql`
       SELECT COUNT(*)::int AS total
       FROM decisions d
       LEFT JOIN raw_events re ON re.id = d.origin_raw_event_id AND re.tenant_id = d.tenant_id
-      WHERE d.tenant_id = ${tenantId} ${temporalFilter} ${recordTypeFilter} ${sourceFilter} ${personalFilter}
+      WHERE d.tenant_id = ${tenantId} ${temporalFilter} ${recordTypeFilter} ${sourceFilter} ${personalFilter} ${visibility}
     `;
     const total = totalRows[0]?.total ?? 0;
 
@@ -778,8 +794,15 @@ async function listDecisions(
   });
 }
 
-async function getDecisionById(tenantId: string, userId: string, decisionId: string) {
+async function getDecisionById(
+  tenantId: string, userId: string, callerScopes: string[], authz: CallerAuthz, decisionId: string,
+) {
   return await withTenant(tenantId, async (sql) => {
+    // A direct fetch must not be a way around the list filter, so the same
+    // fragment runs here. Returning "not found" rather than a 403 for a record
+    // that exists but is out of scope or above clearance is deliberate: a 403
+    // confirms the record exists.
+    const visibility = visibilitySql(sql, callerScopes, authz);
     // Scoped for the same reason listDecisions is, and it matters more
     // here: this is addressable by id, so without it a teammate who
     // learned a decision id could open one extracted from somebody else's
@@ -802,6 +825,7 @@ async function getDecisionById(tenantId: string, userId: string, decisionId: str
             AND psc.connected_by IS NOT NULL
             AND psc.connected_by <> ${userId}::uuid
         )
+        ${visibility}
     `;
     const row = rows[0];
     if (!row) return null;
@@ -939,6 +963,8 @@ function cosineSimilarity(a: number[], b: number[]): number {
 type RetrievalMatch = {
   decision_id: string; decision_statement: string; similarity_score: number;
   confidence: number; permission_scope: string[]; rationale: string | null;
+  /** 0 Public, 1 Internal (the default), 2 Restricted, 3 Confidential. */
+  classification: number;
   alternatives_considered: string[]; created_at: string | null;
   decision_type: string | null; owner: string | null; source: string | null;
 };
@@ -975,7 +1001,7 @@ async function searchSimilarDecisions(
       SELECT
         d.id AS decision_id, d.decision_statement,
         1 - (de.embedding <=> ${vectorLiteral}::vector) AS similarity_score,
-        d.confidence, d.permission_scope, d.rationale, d.alternatives_considered,
+        d.confidence, d.permission_scope, d.classification, d.rationale, d.alternatives_considered,
         d.created_at, d.record_type AS decision_type, ${sql.unsafe(OWNER_SELECT)} AS owner,
         r.source AS source
       FROM public.decision_embeddings de
@@ -988,7 +1014,8 @@ async function searchSimilarDecisions(
     return rows.map((row) => ({
       decision_id: row.decision_id, decision_statement: row.decision_statement,
       similarity_score: Number(row.similarity_score), confidence: Number(row.confidence),
-      permission_scope: row.permission_scope ?? [], rationale: row.rationale,
+      permission_scope: row.permission_scope ?? [],
+      classification: Number(row.classification ?? 1), rationale: row.rationale,
       alternatives_considered: row.alternatives_considered ?? [], created_at: row.created_at,
       decision_type: row.decision_type, owner: row.owner, source: row.source,
     }));
@@ -1014,7 +1041,7 @@ async function searchDecisionsKeyword(
           to_tsvector('english', d.decision_statement || ' ' || COALESCE(d.rationale, '')),
           websearch_to_tsquery('english', ${query})
         ) AS similarity_score,
-        d.confidence, d.permission_scope, d.rationale, d.alternatives_considered,
+        d.confidence, d.permission_scope, d.classification, d.rationale, d.alternatives_considered,
         d.created_at, d.record_type AS decision_type, ${sql.unsafe(OWNER_SELECT)} AS owner,
         r.source AS source
       FROM public.decisions d
@@ -1028,7 +1055,8 @@ async function searchDecisionsKeyword(
     return rows.map((row) => ({
       decision_id: row.decision_id, decision_statement: row.decision_statement,
       similarity_score: Number(row.similarity_score), confidence: Number(row.confidence),
-      permission_scope: row.permission_scope ?? [], rationale: row.rationale,
+      permission_scope: row.permission_scope ?? [],
+      classification: Number(row.classification ?? 1), rationale: row.rationale,
       alternatives_considered: row.alternatives_considered ?? [], created_at: row.created_at,
       decision_type: row.decision_type, owner: row.owner, source: row.source,
     }));
@@ -1097,81 +1125,56 @@ async function hybridRetrieve(
   return fuseRrf(vectorMatches, keywordMatches, fetchK);
 }
 
-// ── Permissions: Layer 2 authorization (mirrors modules/permissions) ─────
+// ── Permissions: Layer 2 authorization ───────────────────────────────────
 
-const SLACK_CHANNEL_RE = /^C[A-Z0-9]{8,}$/;
-const NOTION_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-
-function isUnmappedScope(scope: string): boolean {
-  return SLACK_CHANNEL_RE.test(scope) || NOTION_ID_RE.test(scope);
-}
+// The predicate itself now lives in _shared/permissions.ts, because it used to
+// live HERE and nowhere else - which is exactly why /decisions, /decisions/:id
+// and the MCP tools returned the same rows without ever running it. What stays
+// in this file is only the SQL form of the same rule, for the two paths that
+// have to filter inside the query rather than after it.
 
 /**
- * Real per-scope membership, loaded once per request from
- * public.source_scope_members (populated by slack-membership-sync).
+ * The scope and clearance conditions, as a SQL fragment against an alias `d`.
  *
- * `known` is every scope we have ANY membership data for; `memberOf` is the
- * subset the caller is actually in. The distinction is the whole safety
- * mechanism: a scope we have never synced stays on the old permissive
- * behaviour, so shipping this can't retroactively hide content people are
- * currently, correctly seeing. Coverage tightens as the sync fills in.
+ * Needed because listDecisions paginates with LIMIT/OFFSET. Filtering those
+ * results in TypeScript afterwards would hand back short pages - ask for 20,
+ * get 14, with no way to tell "that is all there is" from "six were withheld"
+ * - so the predicate has to be inside the query that does the counting.
+ *
+ * Kept deliberately in lockstep with scopeAllows()/clearanceAllows(), down to
+ * the unmapped-scope regexes, which are the Slack channel and Notion page id
+ * shapes. The last OR branch is the permissive legacy fallback: it applies
+ * only where we hold NO membership data for any of the record's scopes, and
+ * only to scopes that name a container at all.
  */
-type ScopeAccess = { known: Set<string>; memberOf: Set<string> };
-
-const EMPTY_SCOPE_ACCESS: ScopeAccess = { known: new Set(), memberOf: new Set() };
-
-async function loadScopeAccess(
-  tenantId: string, email: string | null, scopes: string[],
-): Promise<ScopeAccess> {
-  const candidates = [...new Set(scopes.filter(isUnmappedScope))];
-  if (candidates.length === 0) return EMPTY_SCOPE_ACCESS;
-
-  try {
-    const rows = await withTenant(tenantId, async (sql) => {
-      return await sql`
-        select external_scope_id,
-               bool_or(lower(member_email) = lower(${email ?? ""})) as is_member
-        from public.source_scope_members
-        where tenant_id = ${tenantId}::uuid
-          and external_scope_id = any(${candidates}::text[])
-        group by external_scope_id
-      `;
-    });
-    const known = new Set<string>();
-    const memberOf = new Set<string>();
-    for (const row of rows as unknown as { external_scope_id: string; is_member: boolean }[]) {
-      known.add(row.external_scope_id);
-      if (row.is_member) memberOf.add(row.external_scope_id);
-    }
-    return { known, memberOf };
-  } catch (err) {
-    // Fail OPEN on a lookup error rather than locking a tenant out of their
-    // own memory because a telemetry-adjacent table is unavailable. The
-    // deny path below only ever engages on data we successfully read.
-    console.error("scope membership lookup failed, falling back to legacy behaviour:", err);
-    return EMPTY_SCOPE_ACCESS;
-  }
-}
-
-function isDecisionAccessible(
-  permissionScopes: string[], decision: RetrievalMatch, access: ScopeAccess,
-): boolean {
-  if (!decision.permission_scope || decision.permission_scope.length === 0) return true;
-  // Workspace-level scopes and the caller's own email, unchanged.
-  if (decision.permission_scope.some((s) => permissionScopes.includes(s))) return true;
-  // Real membership: the caller is in one of the channels this came from.
-  if (decision.permission_scope.some((s) => access.memberOf.has(s))) return true;
-  // We have real membership data for at least one of these scopes and the
-  // caller is in none of them - this is the case that used to fail open.
-  if (decision.permission_scope.some((s) => access.known.has(s))) return false;
-  // No membership data for any scope yet: unchanged legacy behaviour.
-  return decision.permission_scope.every(isUnmappedScope);
-}
-
-function filterAccessibleDecisions(
-  permissionScopes: string[], matches: RetrievalMatch[], access: ScopeAccess,
-): RetrievalMatch[] {
-  return matches.filter((m) => isDecisionAccessible(permissionScopes, m, access));
+// deno-lint-ignore no-explicit-any
+function visibilitySql(sql: any, callerScopes: string[], authz: CallerAuthz) {
+  const known = [...authz.scopeAccess.known];
+  const memberOf = [...authz.scopeAccess.memberOf];
+  const confidential = [...authz.confidentialScopes];
+  return sql`
+    AND (
+      d.permission_scope IS NULL
+      OR cardinality(d.permission_scope) = 0
+      OR d.permission_scope && ${callerScopes}::text[]
+      OR d.permission_scope && ${memberOf}::text[]
+      OR (
+        NOT (d.permission_scope && ${known}::text[])
+        AND NOT EXISTS (
+          SELECT 1 FROM unnest(d.permission_scope) s
+          WHERE NOT (
+            s ~ '^C[A-Z0-9]{8,}$'
+            OR s ~* '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+          )
+        )
+      )
+    )
+    AND d.classification <= ${authz.clearance}
+    AND (
+      d.classification < 3
+      OR d.permission_scope && ${confidential}::text[]
+    )
+  `;
 }
 
 // ── Context builder (mirrors modules/context/formatter.py, byte-for-byte) ─
@@ -1330,6 +1333,7 @@ Rules:
 - If one or more decisions in the context directly and clearly support an answer, answer confidently and cite them - even if other, less relevant decisions are also present in the context. The presence of topically-related-but-non-answering decisions is NOT a reason to refuse or hedge; only evaluate whether the decisions that actually bear on the question support an answer.
 - Only when two or more decisions DIRECTLY conflict about the same specific fact (not merely adjacent or topically similar) should you explain both viewpoints instead of silently picking one.
 - Set sufficient_evidence to false ONLY when no decision in the context actually answers the question. Do not refuse merely because multiple related decisions exist, but do not guess or partially answer from outside knowledge when the context genuinely lacks a supporting decision.
+- The context is already exactly what this reader is permitted to see - records outside their channels, or above their clearance, were removed before you were called. Never speculate about what is missing, never say that something may exist elsewhere, and never suggest asking someone more senior. If the context does not answer the question, say only that you could not find it. An explanation of WHY something is absent is itself a disclosure of what there is to find.
 ${FORMATTING_RULES}
 ${instruction}
 Call the submit_answer tool exactly once with your response.`;
@@ -1619,8 +1623,12 @@ async function handleSearch(req: Request): Promise<Response> {
    */
   const runRetrieval = async (onStage: StageReport) => {
     const { scopes: permissionScopes, email } = await resolvePermissionScopes(ctx.userId, ctx.tenantId);
+    // Role, clearance, Confidential grants and channel membership, resolved
+    // once for the whole request. Loaded here rather than at the filter site
+    // so its latency overlaps retrieval instead of adding to it.
+    const authz = await loadCallerAuthz(ctx.tenantId, ctx.userId, email);
     trace.mark("resolve_scopes");
-    onStage("resolve_scopes", { scopes: permissionScopes.length });
+    onStage("resolve_scopes", { scopes: permissionScopes.length, clearance: authz.clearance });
 
     // analyzeQuery and embedQuery are independent: embedQuery only needs the
     // raw question text, not analyzeQuery's output (only the keyword-search
@@ -1652,11 +1660,12 @@ async function handleSearch(req: Request): Promise<Response> {
     trace.mark("retrieve");
     onStage("retrieve", { candidates: candidates.length, source: searchSource });
 
-    const scopeAccess = await loadScopeAccess(
-      ctx.tenantId, email, candidates.flatMap((c) => c.permission_scope ?? []),
-    );
-    const authorized = filterAccessibleDecisions(permissionScopes, candidates, scopeAccess);
+    const authorized = filterVisibleRecords(candidates, permissionScopes, authz);
     trace.mark("authorize");
+    // The stage reports only the counts. Which records were withheld, and on
+    // which condition, is not surfaced to the caller and never reaches the
+    // answer: a reader who can tell that something was removed can go looking
+    // for it with a differently worded question.
     onStage("authorize", {
       authorized: authorized.length,
       withheld: Math.max(0, candidates.length - authorized.length),
@@ -1667,7 +1676,7 @@ async function handleSearch(req: Request): Promise<Response> {
     const finalMatches = authorized.slice(0, effectiveTopK);
     const context = formatContext(finalMatches);
 
-    return { analysis, candidates, authorized, finalMatches, context };
+    return { analysis, candidates, authorized, finalMatches, context, authz };
   };
 
   try {
@@ -1929,7 +1938,10 @@ async function saveWeeklyDigest(tenantId: string, digest: any, weekOf: string, u
   });
 }
 
-async function generateTeamPulse(tenantId: string, permissionScopes: string[], callerEmail: string | null, scope: "personal" | "team", userId: string | null) {
+async function generateTeamPulse(
+  tenantId: string, permissionScopes: string[], callerEmail: string | null,
+  scope: "personal" | "team", userId: string | null, authz: CallerAuthz,
+) {
   let personalized = true;
   let question = TEAM_QUESTION;
   if (scope === "personal") {
@@ -1942,10 +1954,22 @@ async function generateTeamPulse(tenantId: string, permissionScopes: string[], c
   }
 
   const matches = await hybridRetrieve(tenantId, question, DIGEST_TOP_K, DIGEST_TOP_K, question, question);
-  const digestScopeAccess = await loadScopeAccess(
-    tenantId, callerEmail, matches.flatMap((m) => m.permission_scope ?? []),
-  );
-  const authorized = filterAccessibleDecisions(permissionScopes, matches, digestScopeAccess);
+
+  // The spec this implements said to build digests per recipient, under that
+  // recipient's clearance. That is right for a product where each digest is
+  // its own artefact, and wrong for this one: weekly_digests carries a CHECK
+  // that a team digest is stored with user_id IS NULL, deliberately, because
+  // it is generated ONCE per tenant per week and served to everyone. Building
+  // it per recipient would multiply the Haiku summary call by the member count
+  // for a row that then cannot be cached, against a $1/day ceiling.
+  //
+  // So the shared artefact is built at the FLOOR instead - the clearance of
+  // its least privileged possible recipient - which is safe for every reader
+  // regardless of who triggers the generation, and costs one call as before.
+  // Exactly the move resolvePermissionScopes already makes above for personal
+  // sources, for exactly the same reason.
+  const digestAuthz = scope === "team" ? floorAuthz(authz) : authz;
+  const authorized = filterVisibleRecords(matches, permissionScopes, digestAuthz);
   const context = formatContext(authorized);
   
   // Use specialized friendly digest summary generation
@@ -2007,6 +2031,9 @@ async function handleDigest(req: Request, url: URL): Promise<Response> {
       { excludePersonalSources: scope === "team" },
     );
     const userId = scope === "personal" ? ctx.userId : null;
+    // Resolved from the real caller either way; generateTeamPulse drops it to
+    // the floor for the shared team artefact.
+    const digestAuthz = await loadCallerAuthz(ctx.tenantId, ctx.userId, callerEmail);
 
     // A non-current week can only ever be served from what's already
     // cached - retrieval isn't date-filtered, so "generating" one now would
@@ -2031,7 +2058,9 @@ async function handleDigest(req: Request, url: URL): Promise<Response> {
     // or count against either limiter.
     await enforceRouteRateLimit(ctx.tenantId, "digest");
     await enforceUserPromptLimit(ctx.userId);
-    const digest = await generateTeamPulse(ctx.tenantId, permissionScopes, callerEmail, scope, userId);
+    const digest = await generateTeamPulse(
+      ctx.tenantId, permissionScopes, callerEmail, scope, userId, digestAuthz,
+    );
     try {
       await saveWeeklyDigest(ctx.tenantId, digest, requestedWeekOf, userId);
     } catch (err) {
@@ -2091,13 +2120,16 @@ async function handleAttention(req: Request): Promise<Response> {
 
   try {
     const { scopes: permissionScopes, email: attentionEmail } = await resolvePermissionScopes(ctx.userId, ctx.tenantId);
+    const attentionAuthz = await loadCallerAuthz(ctx.tenantId, ctx.userId, attentionEmail);
 
     const rows = await withTenant(ctx.tenantId, (sql) =>
       sql`
         SELECT
           dc.id, dc.reason, dc.confidence, dc.created_at,
-          d1.id AS decision_id, d1.decision_statement AS decision_statement, d1.permission_scope AS decision_permission_scope,
-          d2.id AS related_decision_id, d2.decision_statement AS related_decision_statement, d2.permission_scope AS related_permission_scope
+          d1.id AS decision_id, d1.decision_statement AS decision_statement,
+          d1.permission_scope AS decision_permission_scope, d1.classification AS decision_classification,
+          d2.id AS related_decision_id, d2.decision_statement AS related_decision_statement,
+          d2.permission_scope AS related_permission_scope, d2.classification AS related_classification
         FROM public.decision_conflicts dc
         JOIN public.decisions d1 ON d1.id = dc.decision_id AND d1.tenant_id = dc.tenant_id
         JOIN public.decisions d2 ON d2.id = dc.related_decision_id AND d2.tenant_id = dc.tenant_id
@@ -2112,18 +2144,25 @@ async function handleAttention(req: Request): Promise<Response> {
     // the viewer can't even see what Y is would leak its existence.
     const conflictRows = rows as unknown as {
       id: string; reason: string; confidence: number; created_at: string;
-      decision_id: string; decision_statement: string; decision_permission_scope: string[] | null;
-      related_decision_id: string; related_decision_statement: string; related_permission_scope: string[] | null;
+      decision_id: string; decision_statement: string;
+      decision_permission_scope: string[] | null; decision_classification: number | null;
+      related_decision_id: string; related_decision_statement: string;
+      related_permission_scope: string[] | null; related_classification: number | null;
     }[];
 
-    const attentionAccess = await loadScopeAccess(
-      ctx.tenantId, attentionEmail,
-      conflictRows.flatMap((r) => [...(r.decision_permission_scope ?? []), ...(r.related_permission_scope ?? [])]),
-    );
-
+    // Both sides, under the full rule. A conflict is attention-worthy for this
+    // viewer only if they could see BOTH decisions it is between - "X
+    // conflicts with Y" when Y is above their clearance leaks that Y exists
+    // and roughly what it says.
     const accessible = conflictRows.filter((r) =>
-      isDecisionAccessible(permissionScopes, { permission_scope: r.decision_permission_scope ?? [] } as RetrievalMatch, attentionAccess) &&
-      isDecisionAccessible(permissionScopes, { permission_scope: r.related_permission_scope ?? [] } as RetrievalMatch, attentionAccess)
+      isRecordVisible(
+        { permission_scope: r.decision_permission_scope ?? [], classification: r.decision_classification },
+        permissionScopes, attentionAuthz,
+      ) &&
+      isRecordVisible(
+        { permission_scope: r.related_permission_scope ?? [], classification: r.related_classification },
+        permissionScopes, attentionAuthz,
+      )
     );
 
     const items: AttentionConflictItem[] = accessible.slice(0, ATTENTION_STRIP_LIMIT).map((r) => ({
@@ -2264,7 +2303,11 @@ async function handleDecisions(req: Request, url: URL): Promise<Response> {
     // token exchange that runs in front of it on a cold page load.
     const listTrace = new Trace();
     try {
-      const result = await listDecisions(ctx.tenantId, ctx.userId, limit, offset, recordType, source, asOfRaw);
+      const { scopes: listScopes, email: listEmail } = await resolvePermissionScopes(ctx.userId, ctx.tenantId);
+      const listAuthz = await loadCallerAuthz(ctx.tenantId, ctx.userId, listEmail);
+      const result = await listDecisions(
+        ctx.tenantId, ctx.userId, listScopes, listAuthz, limit, offset, recordType, source, asOfRaw,
+      );
       listTrace.mark("list_decisions");
       void listTrace.write(ctx.tenantId, "GET /decisions");
       return jsonResponse(result);
@@ -2286,7 +2329,9 @@ async function handleDecisions(req: Request, url: URL): Promise<Response> {
     // name lookup, so the breakdown matters.
     const detailTrace = new Trace();
     try {
-      const decision = await getDecisionById(ctx.tenantId, ctx.userId, parts[0]);
+      const { scopes: oneScopes, email: oneEmail } = await resolvePermissionScopes(ctx.userId, ctx.tenantId);
+      const oneAuthz = await loadCallerAuthz(ctx.tenantId, ctx.userId, oneEmail);
+      const decision = await getDecisionById(ctx.tenantId, ctx.userId, oneScopes, oneAuthz, parts[0]);
       detailTrace.mark("load_decision");
       if (!decision) return errorResponse(404, "Decision not found");
       void detailTrace.write(ctx.tenantId, "GET /decisions/:id");

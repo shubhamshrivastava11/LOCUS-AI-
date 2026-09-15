@@ -21,7 +21,8 @@
 
 import { SupabaseClient } from "npm:@supabase/supabase-js@2";
 import { getServiceClient } from "../_shared/supabase.ts";
-import { assertStillAMember, visibleRecordIds } from "../_shared/tenantAuth.ts";
+import { assertStillAMember } from "../_shared/tenantAuth.ts";
+import { visibleIdsUnderFullRule } from "../_shared/permissions.ts";
 
 // ── Types ──────────────────────────────────────────────────────────────────────
 
@@ -223,7 +224,7 @@ async function toolSearchDecisions(
     }
 
     const sameTenant = (rows ?? []).filter((r: { tenant_id: string }) => r.tenant_id === ctx.tenantId);
-    const decisions = await dropOthersPersonalRecords(ctx, sameTenant);
+    const decisions = await dropInaccessibleRecords(ctx, sameTenant);
     return { decisions, total: decisions.length, tenant_id: ctx.tenantId };
   }
 
@@ -233,24 +234,32 @@ async function toolSearchDecisions(
   }
 
   const sameTenant = (data ?? []).filter((r: { tenant_id: string }) => r.tenant_id === ctx.tenantId);
-  const decisions = await dropOthersPersonalRecords(ctx, sameTenant);
+  const decisions = await dropInaccessibleRecords(ctx, sameTenant);
   return { decisions, total: decisions.length, tenant_id: ctx.tenantId };
 }
 
 /**
- * Tenant scope was the ONLY authorization MCP applied, so an agent connected
- * by one member could read records extracted from another member's personal
- * Gmail - content the web UI has excluded since the Gmail privacy work.
- * search_decisions_fts filters on p_tenant_id and nothing else, so the
- * distinction has to be applied here.
+ * Every condition of the access rule, applied to whatever a tool is about to
+ * return.
+ *
+ * Tenant id was the ONLY authorization MCP applied for a long time, then the
+ * personal-source rule was added, and scope never was: search_decisions_fts
+ * filters on p_tenant_id and nothing else, and the fallback path is a direct
+ * table read as the service role. So an agent connected by one member could
+ * read records out of Slack channels that member was never in.
+ *
+ * This is the surface where that matters most. An MCP token is held by an
+ * external agent rather than a person looking at a screen, and the agent
+ * inherits the clearance of the user who connected it - never a service-level
+ * view of the tenant.
  */
-async function dropOthersPersonalRecords(
+async function dropInaccessibleRecords(
   ctx: TenantContext,
   rows: { id?: string }[],
 ): Promise<{ id?: string }[]> {
   const ids = rows.map((r) => String(r.id ?? "")).filter((id) => id.length > 0);
   if (ids.length === 0) return rows;
-  const allowed = await visibleRecordIds(ctx.tenantId, ctx.userId, ids);
+  const allowed = await visibleIdsUnderFullRule(ctx.tenantId, ctx.userId, ids);
   return rows.filter((r) => allowed.has(String(r.id ?? "")));
 }
 
@@ -291,6 +300,13 @@ async function toolGetDecisionContext(
     );
     return { error: "not found" };
   }
+
+  // The addressable path needs the same rule the search path runs, or knowing
+  // an id is a way around it. Deliberately the same "not found" the
+  // cross-tenant case returns: a distinct "forbidden" would confirm the record
+  // exists, which for a Confidential record is most of what an attacker wanted.
+  const accessible = await dropInaccessibleRecords(ctx, [{ id: decision.id }]);
+  if (accessible.length === 0) return { error: "not found" };
 
   // Fetch sources for this decision
   const { data: sources, error: sErr } = await supabase

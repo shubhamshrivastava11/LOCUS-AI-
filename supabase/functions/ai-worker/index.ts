@@ -367,6 +367,7 @@ Hard disambiguation:
   - alternatives_considered: options explicitly considered/rejected; empty if none.
   - actors: people explicitly named. "decided_by" (at most one) only if the event states they decided/own/resolve the blocker; else "mentioned". Empty if none named. Never invent an owner or guess from the envelope unless that person is named as owner in the event text. If only a display name appears with no provider id, actors=[].
   - confidence: 0-1 from how explicit the text is. Vague replies needing unseen context ≤ 0.5.
+  - sensitivity: who inside the company should be able to read this. Default to 1 - the overwhelming majority of work is ordinary work, and marking routine records sensitive makes the memory useless to the people who need it. Go above 1 only when the text itself is about a person's pay, performance or employment, an unannounced commercial move, a security incident, or a legal matter. Judge the CONTENT, not where it was posted: a private channel is full of routine messages, and a public one can contain something that should not have been said there.
 
 Call record_triage_and_extraction exactly once with classification, confidence, reason_code, and — when not DISCARD — the extracted record.
 
@@ -563,6 +564,12 @@ const TRIAGE_EXTRACTION_TOOL = {
         items: { type: "string" },
         description: "Explicitly named options considered/rejected; else empty.",
       },
+      sensitivity: {
+        type: ["integer", "null"],
+        enum: [0, 1, 2, 3, null],
+        description:
+          "How sensitive the record is. 0=safe for anyone in the company. 1=ordinary work (DEFAULT - use this unless the text clearly says otherwise). 2=personnel, pay, unreleased commercial plans, security incidents. 3=legal exposure, acquisitions, named-individual performance. Null on DISCARD.",
+      },
       actors: {
         type: "array",
         items: {
@@ -587,7 +594,7 @@ const TRIAGE_EXTRACTION_TOOL = {
     },
     required: [
       "decision", "confidence", "reason_code", "record_type", "status",
-      "decision_statement", "rationale", "alternatives_considered", "actors",
+      "decision_statement", "rationale", "alternatives_considered", "sensitivity", "actors",
     ],
     additionalProperties: false,
   },
@@ -1302,7 +1309,7 @@ async function handleIngestionMessageInner(msg: PgmqMsg): Promise<string> {
   ) as {
     decision: string; confidence: number; reason_code: string;
     record_type: string | null; status: string | null; decision_statement: string | null;
-    rationale: string | null; alternatives_considered: string[];
+    rationale: string | null; alternatives_considered: string[]; sensitivity: number | null;
     actors: { source_actor_id: string; role: string }[];
   };
 
@@ -1337,9 +1344,20 @@ async function handleIngestionMessageInner(msg: PgmqMsg): Promise<string> {
 
   const extraction = result as {
     record_type: string; status: string; decision_statement: string; rationale: string | null;
-    alternatives_considered: string[]; actors: { source_actor_id: string; role: string }[]; confidence: number;
+    alternatives_considered: string[]; actors: { source_actor_id: string; role: string }[];
+    confidence: number; sensitivity: number | null;
   };
   extraction.confidence = result.confidence;
+
+  // The model PROPOSES a level; it does not decide one. Anything outside 0-3,
+  // or absent, falls back to Internal - the same default the column carries -
+  // so a malformed or missing field can never make a record more visible than
+  // the default, and never less visible by accident either.
+  const proposedLevel = typeof result.sensitivity === "number" &&
+      Number.isInteger(result.sensitivity) &&
+      result.sensitivity >= 0 && result.sensitivity <= 3
+    ? result.sensitivity
+    : 1;
 
   // Settings > Build Memory > "Core knowledge only" - real bug found live,
   // same as "Pause all learning": pure local React state before this, no
@@ -1388,14 +1406,35 @@ async function handleIngestionMessageInner(msg: PgmqMsg): Promise<string> {
     `;
     if (existingDecision.length > 0) return existingDecision[0].id as string;
 
+    // A Lead can set a floor for a scope, so everything out of a private HR
+    // channel starts at Restricted whatever the model thought. The floor only
+    // ever raises: max() of the proposal and the highest floor among the
+    // record's scopes, so configuring one can never make anything more
+    // visible than it already was.
+    const floorRows = await sql`
+      SELECT max(floor)::int AS floor FROM public.scope_classification_floors
+      WHERE tenant_id = ${tenantId} AND scope_id = ANY(${payload.permission_scope ?? []}::text[])
+    `;
+    const scopeFloor = Number(floorRows[0]?.floor ?? 0);
+    const classification = Math.max(proposedLevel, scopeFloor);
+    // Which of the three decided the outcome, recorded so a later reviewer can
+    // tell a deliberate policy from a model guess from an untouched default.
+    const classifiedBy = scopeFloor > proposedLevel
+      ? "scope_floor"
+      : classification === 1 && proposedLevel === 1
+      ? "default"
+      : "model";
+
     const decisionRows = await sql`
       INSERT INTO public.decisions (
         tenant_id, record_type, decision_statement, rationale, alternatives_considered,
-        status, scope, confidence, permission_scope, origin_raw_event_id
+        status, scope, confidence, permission_scope, origin_raw_event_id,
+        classification, classified_by, classified_at
       ) VALUES (
         ${tenantId}, ${extraction.record_type}, ${extraction.decision_statement}, ${extraction.rationale},
         ${extraction.alternatives_considered ?? []}, ${extraction.status}, 'team',
-        ${extraction.confidence}, ${payload.permission_scope ?? []}, ${rawEventId}
+        ${extraction.confidence}, ${payload.permission_scope ?? []}, ${rawEventId},
+        ${classification}, ${classifiedBy}, now()
       ) RETURNING id
     `;
     const newDecisionId = decisionRows[0].id as string;
