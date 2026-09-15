@@ -27,9 +27,37 @@ function recordSearchHistory(query: string, resultCount: number) {
  * "Adopt PostgreSQL for the context layer" -> "What do we know about
  * adopt postgresql for the context layer?". Truncated so a long statement
  * doesn't blow out the chip. */
-function toSuggestion(statement: string): string {
-  const trimmed = statement.length > 60 ? `${statement.slice(0, 60).trim()}…` : statement
-  return `What do we know about ${trimmed.replace(/[.?!]+$/, '').toLowerCase()}?`
+/**
+ * A chip the user can tap, and the question it actually asks.
+ *
+ * These used to be one string: the whole decision statement, truncated at 60
+ * characters, wrapped in "What do we know about ...?". That produced ~85
+ * character chips that wrapped across the full width, and the first 22
+ * characters were identical on every single one - the same five words
+ * repeated three times, carrying no information and crowding out the part
+ * that did.
+ *
+ * The label is now just the topic, cut at a word boundary so it never ends
+ * mid-word. The full question is kept separately and is what gets submitted,
+ * so shortening what is displayed costs the search nothing.
+ */
+type Suggestion = { label: string; query: string }
+
+const SUGGESTION_MAX_CHARS = 44
+
+function toSuggestion(statement: string): Suggestion {
+  const clean = statement.replace(/[.?!]+$/, '').trim()
+
+  let label = clean
+  if (label.length > SUGGESTION_MAX_CHARS) {
+    const cut = label.slice(0, SUGGESTION_MAX_CHARS)
+    const lastSpace = cut.lastIndexOf(' ')
+    // Fall back to the hard cut only if there is no space to break on, which
+    // means one very long token rather than a sentence.
+    label = `${(lastSpace > 20 ? cut.slice(0, lastSpace) : cut).trim()}…`
+  }
+
+  return { label, query: `What do we know about ${clean.toLowerCase()}?` }
 }
 
 type RecentSearch = { query: string; at: number }
@@ -116,7 +144,7 @@ export function DashboardSearch() {
   const [stages, setStages] = useState<SearchStage[]>([])
   const [error, setError] = useState('')
   const [recentSearches, setRecentSearches] = useState<RecentSearch[]>([])
-  const [suggestions, setSuggestions] = useState<string[]>([])
+  const [suggestions, setSuggestions] = useState<Suggestion[]>([])
 
   useEffect(() => {
     const demoEmail = sessionStorage.getItem(DEMO_EMAIL_KEY)
@@ -232,19 +260,24 @@ export function DashboardSearch() {
         </div>
       </form>
 
-      {suggestions.length > 0 ? (
+      {/* Only while there is nothing else to look at. These are a prompt for
+          someone staring at an empty box; once a search is running or an
+          answer is on screen they are just clutter sitting between the
+          question and its answer. */}
+      {suggestions.length > 0 && !isSearching && !result && !streamingAnswer ? (
         <div className="mb-7 flex flex-wrap gap-2.5">
-          {suggestions.map((text, i) => (
+          {suggestions.map((suggestion, i) => (
             <button
-              key={`${text}-${i}`}
+              key={`${suggestion.label}-${i}`}
               type="button"
               onClick={() => {
-                setQuestion(text)
-                void runSearch(text)
+                setQuestion(suggestion.query)
+                void runSearch(suggestion.query)
               }}
-              className="rounded-full border border-[#E5E7EB] bg-white px-4 py-2 text-[13px] font-medium text-[#374151] transition-colors hover:bg-[#F9FAFB]"
+              title={suggestion.query}
+              className="max-w-full truncate rounded-full border border-[#E5E7EB] bg-white px-3.5 py-1.5 text-[12.5px] font-medium text-[#374151] transition-colors hover:border-[#C7C2F7] hover:bg-[#F9F8FF] hover:text-[#4c43c9]"
             >
-              {text}
+              {suggestion.label}
             </button>
           ))}
         </div>
