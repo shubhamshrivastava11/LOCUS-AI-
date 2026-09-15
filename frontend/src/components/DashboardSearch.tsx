@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react'
 import { getSupabaseClient } from '../lib/supabase'
-import { ApiError, getDecision, listDecisions, searchDecisionsStreaming, type SearchResponse } from '../lib/api'
+import { ApiError, getDecision, listDecisions, searchDecisionsStreaming, type SearchResponse, type SearchStage } from '../lib/api'
+import { SearchPipeline } from './SearchPipeline'
 import { DEMO_EMAIL_KEY } from '../lib/sessionKeys'
 import { decisionToMemoryRecord } from '../lib/memoryRecord'
 import { MemoryRecordDetail, type MemoryRecord } from './MemoryRecordDetail'
@@ -110,6 +111,9 @@ export function DashboardSearch() {
   // Answer text as it arrives, before the final structured payload (with
   // citations) lands. Cleared once `result` takes over the rendering.
   const [streamingAnswer, setStreamingAnswer] = useState('')
+  // Pipeline stages as the server finishes them. Cleared per search so a
+  // second question never shows the first one's progress.
+  const [stages, setStages] = useState<SearchStage[]>([])
   const [error, setError] = useState('')
   const [recentSearches, setRecentSearches] = useState<RecentSearch[]>([])
   const [suggestions, setSuggestions] = useState<string[]>([])
@@ -154,11 +158,17 @@ export function DashboardSearch() {
     setError('')
     setResult(null)
     setStreamingAnswer('')
+    setStages([])
 
     try {
-      const response = await searchDecisionsStreaming(trimmed, (chunk) => {
-        setStreamingAnswer((current) => current + chunk)
-      })
+      const response = await searchDecisionsStreaming(
+        trimmed,
+        (chunk) => setStreamingAnswer((current) => current + chunk),
+        // Replaces a same-named stage rather than appending, so the
+        // generate_answer "started" frame does not stack up if the server
+        // ever reports it more than once.
+        (stage) => setStages((current) => [...current.filter((s) => s.name !== stage.name), stage]),
+      )
       setResult(response)
       setStreamingAnswer('')
       setRecentSearches((current) => [{ query: trimmed, at: Date.now() }, ...current].slice(0, 5))
@@ -238,6 +248,14 @@ export function DashboardSearch() {
             </button>
           ))}
         </div>
+      ) : null}
+
+      {isSearching ? (
+        <SearchPipeline
+          stages={stages}
+          answerStarted={streamingAnswer.length > 0}
+          done={false}
+        />
       ) : null}
 
       {error ? (

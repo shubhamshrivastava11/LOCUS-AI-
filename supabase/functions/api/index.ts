@@ -1557,9 +1557,44 @@ async function handleSearch(req: Request): Promise<Response> {
 
   const searchStartedAt = Date.now();
   const trace = new Trace();
+
+  // Point-in-time search: {"as_of": "2026-09-01"} answers from the memory as
+  // it stood then, superseded entries included, rather than today's.
+  //
+  // Parsed up here, before any work, specifically so a malformed value is
+  // still a clean 400. Once the stream below is open the status line has
+  // already been sent and the only way left to report a bad request is an
+  // error frame, which is a worse answer to "you typed the date wrong".
+  let searchAsOf: Date | null = null;
   try {
+    searchAsOf = parseAsOf(typeof body.as_of === "string" ? body.as_of : null);
+  } catch {
+    return errorResponse(400, "as_of must be an ISO 8601 date or timestamp");
+  }
+
+  /**
+   * Reports a finished pipeline stage. A no-op on the non-streaming path.
+   *
+   * Exists because the median search spends 2.3s in analyze_and_embed before
+   * the first byte of the answer exists, and the browser had no way to know
+   * anything was happening during it - measured from request_traces, not
+   * guessed. The counts are passed through so the UI can show what each stage
+   * actually did rather than an indeterminate spinner.
+   */
+  type StageReport = (name: string, detail: Record<string, unknown>) => void;
+
+  /**
+   * Everything up to answer generation.
+   *
+   * Extracted verbatim so both paths run the same code: the streaming branch
+   * needs it INSIDE the response stream (so stages can be reported as they
+   * complete), the JSON branch needs it before building the body, and the one
+   * thing worse than this indirection would be two copies drifting apart.
+   */
+  const runRetrieval = async (onStage: StageReport) => {
     const { scopes: permissionScopes, email } = await resolvePermissionScopes(ctx.userId, ctx.tenantId);
     trace.mark("resolve_scopes");
+    onStage("resolve_scopes", { scopes: permissionScopes.length });
 
     // analyzeQuery and embedQuery are independent: embedQuery only needs the
     // raw question text, not analyzeQuery's output (only the keyword-search
@@ -1573,6 +1608,10 @@ async function handleSearch(req: Request): Promise<Response> {
       embedQuery(question),
     ]);
     trace.mark("analyze_and_embed");
+    onStage("analyze_and_embed", {
+      question_type: analysis.question_type,
+      is_multi_document: analysis.is_multi_document,
+    });
 
     let effectiveTopK = Math.max(requestedTopK, RERANK_MIN_TOP_K);
     if (analysis.is_multi_document) {
@@ -1580,37 +1619,41 @@ async function handleSearch(req: Request): Promise<Response> {
     }
     const candidateK = Math.max(DEFAULT_CANDIDATE_K, effectiveTopK * 2);
 
-    // Point-in-time search: {"as_of": "2026-09-01"} answers from the memory
-    // as it stood then, superseded entries included, rather than today's.
-    let searchAsOf: Date | null = null;
-    try {
-      searchAsOf = parseAsOf(typeof body.as_of === "string" ? body.as_of : null);
-    } catch {
-      return errorResponse(400, "as_of must be an ISO 8601 date or timestamp");
-    }
     const candidates = await hybridRetrieve(
       ctx.tenantId, question, effectiveTopK, candidateK, question, keywordSearchQuery(analysis),
       precomputedEmbedding, searchAsOf,
     );
     trace.mark("retrieve");
+    onStage("retrieve", { candidates: candidates.length });
 
     const scopeAccess = await loadScopeAccess(
       ctx.tenantId, email, candidates.flatMap((c) => c.permission_scope ?? []),
     );
     const authorized = filterAccessibleDecisions(permissionScopes, candidates, scopeAccess);
     trace.mark("authorize");
+    onStage("authorize", {
+      authorized: authorized.length,
+      withheld: Math.max(0, candidates.length - authorized.length),
+    });
 
     // No cross-encoder here (see file header) - truncate to effectiveTopK directly,
     // reproducing that module's own fail-open fallback path exactly.
     const finalMatches = authorized.slice(0, effectiveTopK);
-
     const context = formatContext(finalMatches);
 
+    return { analysis, candidates, authorized, finalMatches, context };
+  };
+
+  try {
     // Streaming path. Same retrieval, same model, same forced tool - the
     // only difference is that the answer reaches the browser as it is
     // written instead of after the full ~4.9s synthesis call. Opt-in via
     // {stream: true} so the existing non-streaming contract keeps working
     // untouched for the MCP server and any other caller.
+    //
+    // The response opens BEFORE retrieval now, not after. That is what lets
+    // the 2.3s of query analysis and embedding be visible to the caller
+    // instead of silent.
     if (wantsStream) {
       const encoder = new TextEncoder();
       const sse = new ReadableStream({
@@ -1621,6 +1664,21 @@ async function handleSearch(req: Request): Promise<Response> {
             ));
           };
           try {
+            const { analysis, candidates, authorized, finalMatches, context } = await runRetrieval(
+              (name, detail) => send("stage", {
+                name,
+                elapsed_ms: Date.now() - searchStartedAt,
+                ...detail,
+              }),
+            );
+
+            send("stage", {
+              name: "generate_answer",
+              status: "started",
+              elapsed_ms: Date.now() - searchStartedAt,
+              decisions: finalMatches.length,
+            });
+
             const answerResult = await generateAnswerStreaming(
               question, context, analysis, (chunk) => send("delta", { text: chunk }),
             );
@@ -1668,6 +1726,8 @@ async function handleSearch(req: Request): Promise<Response> {
         },
       });
     }
+
+    const { analysis, candidates, authorized, finalMatches, context } = await runRetrieval(() => {});
 
     const answerResult = await generateAnswer(question, context, analysis);
     const citations = buildCitations(answerResult.citations, finalMatches);

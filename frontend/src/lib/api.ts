@@ -377,9 +377,32 @@ export function searchDecisions(question: string): Promise<SearchResponse> {
  * that buffers or strips event-streams degrades to today's behaviour rather
  * than breaking search outright.
  */
+/**
+ * One completed step of the retrieval pipeline, reported by the server as it
+ * happens. The median search spends 2.3s in analyze_and_embed before a single
+ * character of the answer exists, and until these events existed the browser
+ * had no way to know anything was happening during it.
+ *
+ * Every field beyond `name` and `elapsed_ms` is whatever that particular stage
+ * actually measured, so the UI can say "20 candidates" rather than spin.
+ */
+export interface SearchStage {
+  name: 'resolve_scopes' | 'analyze_and_embed' | 'retrieve' | 'authorize' | 'generate_answer'
+  elapsed_ms: number
+  status?: string
+  scopes?: number
+  question_type?: string
+  is_multi_document?: boolean
+  candidates?: number
+  authorized?: number
+  withheld?: number
+  decisions?: number
+}
+
 export async function searchDecisionsStreaming(
   question: string,
   onDelta: (chunk: string) => void,
+  onStage?: (stage: SearchStage) => void,
 ): Promise<SearchResponse> {
   const token = await getBackendToken()
 
@@ -446,6 +469,7 @@ export async function searchDecisionsStreaming(
       try {
         const parsed = JSON.parse(data)
         if (event === 'delta' && typeof parsed.text === 'string') onDelta(parsed.text)
+        else if (event === 'stage' && typeof parsed.name === 'string') onStage?.(parsed as SearchStage)
         else if (event === 'done') final = parsed as SearchResponse
         else if (event === 'error') streamError = String(parsed.error ?? 'Search failed')
       } catch {
