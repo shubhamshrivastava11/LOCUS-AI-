@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react'
 import { getSupabaseClient } from '../lib/supabase'
 import { ApiError, getDecision, listDecisions, searchDecisionsStreaming, type SearchResponse, type SearchStage } from '../lib/api'
 import { SearchPipeline } from './SearchPipeline'
+import { useSmoothText } from '../lib/useSmoothText'
 import { DEMO_EMAIL_KEY } from '../lib/sessionKeys'
 import { decisionToMemoryRecord } from '../lib/memoryRecord'
 import { MemoryRecordDetail, type MemoryRecord } from './MemoryRecordDetail'
@@ -142,6 +143,15 @@ export function DashboardSearch() {
   // Pipeline stages as the server finishes them. Cleared per search so a
   // second question never shows the first one's progress.
   const [stages, setStages] = useState<SearchStage[]>([])
+
+  // The answer as it should eventually read. While streaming that is whatever
+  // has arrived; once the `done` frame lands it is the authoritative full
+  // text, which the citations index into.
+  const answerTarget = result?.answer ?? streamingAnswer
+  // ...and what is actually painted. Deltas arrive in uneven bursts, so
+  // rendering them directly made the text lurch; this walks a visible prefix
+  // toward the target a few characters a frame. See lib/useSmoothText.ts.
+  const { text: shownAnswer, isSettled } = useSmoothText(answerTarget)
   const [error, setError] = useState('')
   const [recentSearches, setRecentSearches] = useState<RecentSearch[]>([])
   const [suggestions, setSuggestions] = useState<Suggestion[]>([])
@@ -297,21 +307,27 @@ export function DashboardSearch() {
         </div>
       ) : null}
 
-      {!result && streamingAnswer ? (
+      {/* One block for both phases. There used to be two - a streaming one and
+          a finished one - and swapping between them was a visible jump,
+          because the `done` frame carries the whole answer and everything not
+          yet shown landed at once. Rendering the same smoothed text
+          throughout means the end of an answer arrives at the same pace as
+          the middle of it. */}
+      {shownAnswer ? (
         <div className="mb-7 rounded-xl border border-[#E8E8ED] bg-white p-5 shadow-[0_1px_2px_rgba(16,24,40,0.04)]">
           <p className="text-[15px] leading-6 whitespace-pre-wrap text-[#111827]">
-            {streamingAnswer}
-            <span className="ml-0.5 inline-block h-[1.05em] w-[2px] translate-y-[0.15em] animate-pulse bg-[#5A45FF] align-middle" />
+            {shownAnswer}
+            {/* Driven by "the answer is not finished", not "the reveal has
+                caught up". Between delta bursts the reveal momentarily catches
+                up to everything received so far, and keying the caret off that
+                made it blink out mid-answer and come back. */}
+            {!(result && isSettled) ? (
+              <span className="locus-pipeline-caret ml-0.5 inline-block h-[1.05em] w-[2px] translate-y-[0.15em] bg-[#5A45FF] align-middle" />
+            ) : null}
           </p>
-        </div>
-      ) : null}
-
-      {result ? (
-        <div className="mb-7 rounded-xl border border-[#E8E8ED] bg-white p-5 shadow-[0_1px_2px_rgba(16,24,40,0.04)]">
-          <p className="text-[15px] leading-6 whitespace-pre-wrap text-[#111827]">
-            {result.answer}
-          </p>
-          {result.citations.length > 0 ? (
+          {/* Citations wait for the prose to finish. Sitting under a
+              half-written answer they read as part of it. */}
+          {result && isSettled && result.citations.length > 0 ? (
             <ul className="mt-4 flex flex-col gap-2 border-t border-[#F0F0F4] pt-4">
               {result.citations.map((citation) => (
                 <CitationRow
