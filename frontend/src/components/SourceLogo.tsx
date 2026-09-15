@@ -22,6 +22,35 @@ const FALLBACK_BADGE: Partial<Record<SourceName, { letter: string; bg: string; f
   Teams: { letter: 'T', bg: '#6264A7', fg: '#FFFFFF' },
 }
 
+/**
+ * Maps the API's source name to the display name used here.
+ *
+ * The two differ, and the difference is not mechanical: the database and the
+ * API deal in lowercase ('github', 'clickup'), while these are brand names
+ * with their own capitalisation. Naively upper-casing the first letter gives
+ * "Github" and "Clickup", and passing the lowercase value straight through
+ * matches no key at all, so every source silently renders the grey "?"
+ * fallback badge.
+ *
+ * Returns null for anything unrecognised rather than guessing.
+ */
+const BY_API_NAME: Record<string, SourceName> = {
+  slack: 'Slack',
+  notion: 'Notion',
+  gmail: 'Gmail',
+  jira: 'Jira',
+  confluence: 'Confluence',
+  discord: 'Discord',
+  github: 'GitHub',
+  monday: 'Monday',
+  clickup: 'ClickUp',
+  teams: 'Teams',
+}
+
+export function toSourceName(apiSource: string): SourceName | null {
+  return BY_API_NAME[apiSource.trim().toLowerCase()] ?? null
+}
+
 export function SourceLogo({
   source,
   className = 'h-6 w-6',

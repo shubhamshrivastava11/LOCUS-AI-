@@ -358,10 +358,10 @@ export interface DigestResponse {
 
 // ---- Typed convenience wrappers for the endpoints this app calls ----
 
-export function searchDecisions(question: string): Promise<SearchResponse> {
+export function searchDecisions(question: string, source?: string | null): Promise<SearchResponse> {
   return apiFetch<SearchResponse>('/search', {
     method: 'POST',
-    body: JSON.stringify({ question }),
+    body: JSON.stringify({ question, ...(source ? { source } : {}) }),
   })
 }
 
@@ -394,6 +394,8 @@ export interface SearchStage {
   question_type?: string
   is_multi_document?: boolean
   candidates?: number
+  /** Set when the search was scoped to one connector. */
+  source?: string | null
   authorized?: number
   withheld?: number
   decisions?: number
@@ -403,6 +405,8 @@ export async function searchDecisionsStreaming(
   question: string,
   onDelta: (chunk: string) => void,
   onStage?: (stage: SearchStage) => void,
+  /** Restrict the search to a single connector, e.g. 'slack'. */
+  source?: string | null,
 ): Promise<SearchResponse> {
   const token = await getBackendToken()
 
@@ -416,10 +420,10 @@ export async function searchDecisionsStreaming(
         'x-region': FUNCTION_REGION,
         Accept: 'text/event-stream',
       },
-      body: JSON.stringify({ question, stream: true }),
+      body: JSON.stringify({ question, stream: true, ...(source ? { source } : {}) }),
     })
   } catch {
-    return searchDecisions(question)
+    return searchDecisions(question, source)
   }
 
   if (!response.ok) {

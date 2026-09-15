@@ -955,6 +955,7 @@ const OWNER_SELECT = `
 
 async function searchSimilarDecisions(
   tenantId: string, embedding: number[], topK: number, asOf?: Date | null,
+  source?: string | null,
 ): Promise<RetrievalMatch[]> {
   const vectorLiteral = "[" + embedding.join(",") + "]";
   return await withTenant(tenantId, async (sql) => {
@@ -967,6 +968,9 @@ async function searchSimilarDecisions(
       ? sql`AND d.valid_from <= ${asOf.toISOString()}::timestamptz
             AND (d.valid_until IS NULL OR d.valid_until > ${asOf.toISOString()}::timestamptz)`
       : sql`AND d.superseded_by IS NULL`;
+    // raw_events was already joined here for the source column, so narrowing
+    // to a single connector costs no extra work.
+    const sourceFilter = source ? sql`AND r.source = ${source}` : sql``;
     const rows = await sql`
       SELECT
         d.id AS decision_id, d.decision_statement,
@@ -977,7 +981,7 @@ async function searchSimilarDecisions(
       FROM public.decision_embeddings de
       JOIN public.decisions d ON d.id = de.decision_id AND d.tenant_id = de.tenant_id
       LEFT JOIN public.raw_events r ON r.id = d.origin_raw_event_id AND r.tenant_id = d.tenant_id
-      WHERE d.tenant_id = ${tenantId} ${temporalFilter}
+      WHERE d.tenant_id = ${tenantId} ${temporalFilter} ${sourceFilter}
       ORDER BY de.embedding <=> ${vectorLiteral}::vector ASC
       LIMIT ${topK}
     `;
@@ -993,6 +997,7 @@ async function searchSimilarDecisions(
 
 async function searchDecisionsKeyword(
   tenantId: string, question: string, topK: number, asOf?: Date | null,
+  source?: string | null,
 ): Promise<RetrievalMatch[]> {
   const query = question.trim();
   if (!query) return [];
@@ -1001,6 +1006,7 @@ async function searchDecisionsKeyword(
       ? sql`AND d.valid_from <= ${asOf.toISOString()}::timestamptz
             AND (d.valid_until IS NULL OR d.valid_until > ${asOf.toISOString()}::timestamptz)`
       : sql`AND d.superseded_by IS NULL`;
+    const sourceFilter = source ? sql`AND r.source = ${source}` : sql``;
     const rows = await sql`
       SELECT
         d.id AS decision_id, d.decision_statement,
@@ -1013,7 +1019,7 @@ async function searchDecisionsKeyword(
         r.source AS source
       FROM public.decisions d
       LEFT JOIN public.raw_events r ON r.id = d.origin_raw_event_id AND r.tenant_id = d.tenant_id
-      WHERE d.tenant_id = ${tenantId} ${temporalFilter}
+      WHERE d.tenant_id = ${tenantId} ${temporalFilter} ${sourceFilter}
         AND to_tsvector('english', d.decision_statement || ' ' || COALESCE(d.rationale, ''))
             @@ websearch_to_tsquery('english', ${query})
       ORDER BY similarity_score DESC, d.created_at DESC
@@ -1079,12 +1085,14 @@ async function hybridRetrieve(
   // call. Falls back to computing it inline, same as before, when omitted.
   precomputedEmbedding?: number[],
   asOf?: Date | null,
+  /** Restrict to one connector, e.g. only what came from Slack. */
+  source?: string | null,
 ): Promise<RetrievalMatch[]> {
   const fetchK = Math.max(candidateK, topK);
   const embedding = precomputedEmbedding ?? await embedQuery(embeddingQuery || question);
   const [vectorMatches, keywordMatches] = await Promise.all([
-    searchSimilarDecisions(tenantId, embedding, fetchK, asOf),
-    searchDecisionsKeyword(tenantId, keywordQuery || question, fetchK, asOf),
+    searchSimilarDecisions(tenantId, embedding, fetchK, asOf, source),
+    searchDecisionsKeyword(tenantId, keywordQuery || question, fetchK, asOf, source),
   ]);
   return fuseRrf(vectorMatches, keywordMatches, fetchK);
 }
@@ -1520,6 +1528,14 @@ function buildCitations(citationNumbers: number[], authorized: RetrievalMatch[])
 
 // ── Handler: POST /search ──────────────────────────────────────────────
 
+// Mirrors the source CHECK constraint on raw_events. Kept as a list rather
+// than read from the database because it is used to reject a bad request
+// before any query runs.
+const SEARCHABLE_SOURCES = [
+  "slack", "gmail", "notion", "jira", "confluence",
+  "discord", "github", "monday", "clickup", "teams",
+];
+
 const DEFAULT_TOP_K = 5;
 const MAX_TOP_K = 50;
 const DEFAULT_CANDIDATE_K = 20;
@@ -1544,7 +1560,7 @@ async function handleSearch(req: Request): Promise<Response> {
     return errorResponse(500, "Failed to enforce prompt limit");
   }
 
-  let body: { question?: string; top_k?: number; stream?: boolean; as_of?: string };
+  let body: { question?: string; top_k?: number; stream?: boolean; as_of?: string; source?: string };
   try {
     body = await req.json();
   } catch {
@@ -1553,6 +1569,16 @@ async function handleSearch(req: Request): Promise<Response> {
   const question = (body.question ?? "").trim();
   if (!question) return errorResponse(422, "question is required");
   const wantsStream = body.stream === true;
+
+  // Optional single-connector scope: "only what came from Slack". Validated
+  // against the known set rather than passed straight through, so a typo
+  // produces a 422 the caller can act on instead of a confident "I could not
+  // find anything" about a source that does not exist.
+  const requestedSource = typeof body.source === "string" ? body.source.trim() : "";
+  if (requestedSource && !SEARCHABLE_SOURCES.includes(requestedSource)) {
+    return errorResponse(422, `Unknown source: ${requestedSource}`);
+  }
+  const searchSource = requestedSource || null;
   const requestedTopK = Math.min(Math.max(body.top_k ?? DEFAULT_TOP_K, 1), MAX_TOP_K);
 
   const searchStartedAt = Date.now();
@@ -1621,10 +1647,10 @@ async function handleSearch(req: Request): Promise<Response> {
 
     const candidates = await hybridRetrieve(
       ctx.tenantId, question, effectiveTopK, candidateK, question, keywordSearchQuery(analysis),
-      precomputedEmbedding, searchAsOf,
+      precomputedEmbedding, searchAsOf, searchSource,
     );
     trace.mark("retrieve");
-    onStage("retrieve", { candidates: candidates.length });
+    onStage("retrieve", { candidates: candidates.length, source: searchSource });
 
     const scopeAccess = await loadScopeAccess(
       ctx.tenantId, email, candidates.flatMap((c) => c.permission_scope ?? []),

@@ -1,8 +1,17 @@
 import { useEffect, useState } from 'react'
 import { getSupabaseClient } from '../lib/supabase'
-import { ApiError, getDecision, listDecisions, searchDecisionsStreaming, type SearchResponse, type SearchStage } from '../lib/api'
+import {
+  ApiError,
+  getDecision,
+  listDecisions,
+  listDecisionSources,
+  searchDecisionsStreaming,
+  type SearchResponse,
+  type SearchStage,
+} from '../lib/api'
 import { SearchPipeline } from './SearchPipeline'
 import { useSmoothText } from '../lib/useSmoothText'
+import { SourceLogo, toSourceName } from './SourceLogo'
 import { DEMO_EMAIL_KEY } from '../lib/sessionKeys'
 import { decisionToMemoryRecord } from '../lib/memoryRecord'
 import { MemoryRecordDetail, type MemoryRecord } from './MemoryRecordDetail'
@@ -144,6 +153,14 @@ export function DashboardSearch() {
   // second question never shows the first one's progress.
   const [stages, setStages] = useState<SearchStage[]>([])
 
+  // Connectors that actually have records behind them. The same endpoint
+  // Memory Explorer's filter uses, so a source never appears here unless
+  // searching it could return something.
+  const [sources, setSources] = useState<string[]>([])
+  // null means every source - the default, and what the product did before
+  // this existed.
+  const [activeSource, setActiveSource] = useState<string | null>(null)
+
   // The answer as it should eventually read. While streaming that is whatever
   // has arrived; once the `done` frame lands it is the authoritative full
   // text, which the citations index into.
@@ -179,6 +196,13 @@ export function DashboardSearch() {
   // than examples that imply data that isn't there.
   useEffect(() => {
     if (sessionStorage.getItem(DEMO_EMAIL_KEY)) return
+    listDecisionSources()
+      .then((response) => setSources(response.sources))
+      .catch(() => {
+        // The picker simply does not render; search still works across
+        // everything, which is the same behaviour as before it existed.
+      })
+
     listDecisions(3, 0)
       .then((response) => {
         setSuggestions(response.items.map((item) => toSuggestion(item.decision_statement)))
@@ -188,9 +212,13 @@ export function DashboardSearch() {
       })
   }, [])
 
-  const runSearch = async (submittedQuestion: string) => {
+  // scopeOverride exists because a chip click changes the scope and re-asks
+  // in the same handler: reading activeSource here would read the value from
+  // the render that is being replaced, and search the previous source.
+  const runSearch = async (submittedQuestion: string, scopeOverride?: string | null) => {
     const trimmed = submittedQuestion.trim()
     if (!trimmed || isSearching) return
+    const scope = scopeOverride === undefined ? activeSource : scopeOverride
 
     setIsSearching(true)
     setError('')
@@ -206,6 +234,7 @@ export function DashboardSearch() {
         // generate_answer "started" frame does not stack up if the server
         // ever reports it more than once.
         (stage) => setStages((current) => [...current.filter((s) => s.name !== stage.name), stage]),
+        scope,
       )
       setResult(response)
       setStreamingAnswer('')
@@ -269,6 +298,66 @@ export function DashboardSearch() {
           </button>
         </div>
       </form>
+
+      {/* Scope control, not a prompt - unlike the suggestions below it, this
+          stays put once an answer is on screen so the scope of the answer you
+          are reading is always visible. Hidden entirely with fewer than two
+          sources, where the only choice would be "all" versus the one thing
+          that is in it. */}
+      {sources.length > 1 ? (
+        <div className="mb-3.5 flex flex-wrap items-center gap-1.5">
+          <span className="mr-0.5 text-[11px] font-semibold uppercase tracking-wide text-[#9CA3AF]">
+            Search in
+          </span>
+          <button
+            type="button"
+            onClick={() => setActiveSource(null)}
+            aria-pressed={activeSource === null}
+            className={`rounded-full border px-3 py-1 text-[12px] font-medium transition-colors ${
+              activeSource === null
+                ? 'border-[#5b52e8] bg-[#5b52e8] text-white'
+                : 'border-[#E5E7EB] bg-white text-[#374151] hover:border-[#C7C2F7] hover:bg-[#F9F8FF]'
+            }`}
+          >
+            All sources
+          </button>
+          {sources.map((source) => {
+            const selected = activeSource === source
+            // Unrecognised sources are skipped rather than rendered as a grey
+            // "?" - a chip nobody can identify is worse than one fewer chip.
+            const display = toSourceName(source)
+            if (!display) return null
+            return (
+              <button
+                key={source}
+                type="button"
+                onClick={() => {
+                  const next = selected ? null : source
+                  setActiveSource(next)
+                  // Re-ask under the new scope, but only when an answer is
+                  // already on screen. A filter that leaves a stale answer
+                  // sitting above it is worse than no filter; firing a search
+                  // because someone picked a scope before typing anything
+                  // would be worse still.
+                  if (result && question.trim() && !isSearching) {
+                    void runSearch(question, next)
+                  }
+                }}
+                aria-pressed={selected}
+                title={`Search only ${display}`}
+                className={`flex items-center gap-1.5 rounded-full border px-3 py-1 text-[12px] font-medium transition-colors ${
+                  selected
+                    ? 'border-[#5b52e8] bg-[#5b52e8] text-white'
+                    : 'border-[#E5E7EB] bg-white text-[#374151] hover:border-[#C7C2F7] hover:bg-[#F9F8FF]'
+                }`}
+              >
+                <SourceLogo source={display} className="h-3.5 w-3.5" />
+                {display}
+              </button>
+            )
+          })}
+        </div>
+      ) : null}
 
       {/* Only while there is nothing else to look at. These are a prompt for
           someone staring at an empty box; once a search is running or an
