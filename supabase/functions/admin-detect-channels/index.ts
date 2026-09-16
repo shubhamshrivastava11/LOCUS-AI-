@@ -533,8 +533,11 @@ async function exploreTenant(
       from public.decision_embeddings a
       join public.decision_embeddings b
         on b.tenant_id = a.tenant_id and a.decision_id < b.decision_id
+      join public.decisions da on da.id = a.decision_id and da.tenant_id = a.tenant_id
+      join public.decisions db on db.id = b.decision_id and db.tenant_id = b.tenant_id
       where a.tenant_id = ${tenantId}::uuid
         and 1 - (a.embedding <=> b.embedding) >= ${cosineFloor}
+        and da.superseded_by is null and db.superseded_by is null
     `
   ) as unknown as { n: number }[];
   const total = totalRows[0]?.n ?? 0;
@@ -602,7 +605,14 @@ async function exploreTenant(
     pairs_total: total,
     pairs_examined: rows.length,
     pair_offset: offset,
-    next_offset: offset + rows.length < total ? offset + rows.length : null,
+    // A short page means the end, whatever the count says. Belt and braces
+    // against the two queries drifting apart again: when they last disagreed -
+    // the count omitted the decisions join, so it counted 455 pairs the page
+    // could only produce 435 of - next_offset never became null and the client
+    // loop spun on an empty page forever.
+    next_offset: rows.length === limit && offset + rows.length < total
+      ? offset + rows.length
+      : null,
     calls,
     found_count: found.length,
     run_cost_usd: Number(spentThisRun.toFixed(4)),

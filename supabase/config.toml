@@ -466,6 +466,13 @@ verify_jwt = true
 [functions.admin-detect-channels]
 verify_jwt = false
 
+# Same posture, same reason: requireInternalKey is the gate and it fails closed
+# without the secret. It also needs to be reachable by an uptime pinger that
+# holds the internal key and no Supabase credential, which a gateway JWT
+# requirement would make impossible.
+[functions.admin-health]
+verify_jwt = false
+
 [functions.admin-pipeline-status]
 verify_jwt = false
 

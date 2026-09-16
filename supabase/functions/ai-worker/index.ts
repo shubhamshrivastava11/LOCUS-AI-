@@ -1043,7 +1043,22 @@ async function isCaptureExcluded(
 ): Promise<boolean> {
   if (itemIds.length === 0) return false;
   try {
-    const rows = await withTenant(tenantId, async (sql) => {
+    // withAdmin, because public.capture_source_rules carries exactly one
+    // policy and it is granted to `authenticated` for PostgREST. The locus_app
+    // lane has none, so this read through withTenant returned zero rows for
+    // every tenant, every time - which made this function always answer
+    // "not excluded" and meant the per-item toggles in Settings > Build Memory
+    // never actually stopped anything being captured.
+    //
+    // It did not error and the catch below never fired, so there was no signal
+    // at all: an empty result is indistinguishable from "this tenant has not
+    // set any rules", which is also the common case. Found by the
+    // adminOnlyTables test, written after the same mistake in loadCallerAuthz
+    // took the product down on 16 Sep 2026.
+    //
+    // tenant_id stays pinned in the WHERE clause, which is the Layer-2 scoping
+    // this codebase uses wherever the admin connection is unavoidable.
+    const rows = await withAdmin(async (sql) => {
       return await sql`
         SELECT included FROM public.capture_source_rules
         WHERE tenant_id = ${tenantId} AND source = ${source}
