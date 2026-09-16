@@ -25,7 +25,7 @@
 // routes that return the same rows - never ran the scope check at all. One
 // implementation is the only arrangement that stops that recurring.
 
-import { withTenant } from "./db.ts";
+import { withAdmin, withTenant } from "./db.ts";
 import { resolvePermissionScopes, visibleRecordIds } from "./tenantAuth.ts";
 
 // ── Clearance ────────────────────────────────────────────────────────────
@@ -165,7 +165,20 @@ export async function loadCallerAuthz(
   email: string | null,
 ): Promise<CallerAuthz> {
   const [membership, grants, owned, scopeAccess] = await Promise.all([
-    withTenant(tenantId, async (sql) => {
+    // withAdmin, not withTenant, and this is load-bearing. public.memberships
+    // has RLS enabled AND forced with exactly one policy, scoped to the
+    // `authenticated` role - there is no policy for the locus_app lane at all,
+    // so a withTenant read of this table returns zero rows for everyone,
+    // always. getCurrentTenant already reads it through withAdmin for the same
+    // reason.
+    //
+    // Getting this wrong took the whole product down for a day: no row meant
+    // role level 0, clearance 0 hides everything at Internal, and Internal is
+    // the default every record carries. Every dashboard in production read
+    // zero decisions. The tenant and user are both pinned in the WHERE clause,
+    // which is the Layer-2 scoping this codebase uses wherever the admin
+    // connection is unavoidable.
+    withAdmin(async (sql) => {
       const rows = await sql`
         select role, role_level, can_manage_connectors, can_view_audit, expires_at
         from public.memberships
@@ -189,11 +202,16 @@ export async function loadCallerAuthz(
     loadScopeAccess(tenantId, email),
   ]);
 
-  // No membership row means the caller is not in this tenant at all. Callers
-  // reach this only after getCurrentTenant has already asserted membership, so
-  // this is a belt-and-braces deny rather than an expected path - but it must
-  // deny, not default to Member, or a removed member would keep Internal
-  // clearance until their JWT expired.
+  // No membership row means the caller is not in this tenant at all, and every
+  // caller reaches this only after getCurrentTenant has already asserted
+  // membership - so it cannot legitimately happen, and when it did happen it
+  // was a broken query rather than a removed member.
+  //
+  // Which is why it now THROWS instead of quietly degrading to clearance 0.
+  // Silently returning "you may see nothing" is indistinguishable from an empty
+  // workspace: the dashboard renders zeroes, nothing is logged, and the product
+  // looks like it lost the data rather than like it has a bug. A 500 with this
+  // message is worse for one request and enormously better for everyone.
   const row = membership as
     | {
       role: string;
@@ -204,22 +222,30 @@ export async function loadCallerAuthz(
     }
     | null;
 
-  // An expired Guest is no longer a caller. Dropping to level 0 with clearance
-  // 0 rather than throwing, because the same expiry has to be enforced
-  // wherever this is used and a uniform "sees nothing above Public" is easier
-  // to reason about than an exception some call sites catch.
-  const expired = row?.expires_at ? new Date(row.expires_at).getTime() <= Date.now() : false;
-  const roleLevel = !row || expired ? 0 : Number(row.role_level ?? 2);
+
+  if (!row) {
+    throw new Error(
+      `No membership for user ${userId} in tenant ${tenantId} - refusing to ` +
+      `resolve an access level. This is a bug, not an empty workspace: every ` +
+      `caller here has already passed getCurrentTenant.`,
+    );
+  }
+
+  // An expired Guest IS an expected path, and unlike the case above it degrades
+  // rather than throws: their membership is real, it has simply run out, and
+  // "sees nothing above Public" is the defined behaviour rather than a fault.
+  const expired = row.expires_at ? new Date(row.expires_at).getTime() <= Date.now() : false;
+  const roleLevel = expired ? 0 : Number(row.role_level ?? 2);
 
   return {
     userId,
     tenantId,
     email,
-    role: row?.role ?? "none",
+    role: row.role,
     roleLevel,
     clearance: clearanceForLevel(roleLevel),
-    canManageConnectors: row?.can_manage_connectors === true,
-    canViewAudit: row?.can_view_audit === true,
+    canManageConnectors: row.can_manage_connectors === true,
+    canViewAudit: row.can_view_audit === true,
     confidentialScopes: new Set(
       (grants as unknown as { scope_id: string }[]).map((g) => g.scope_id),
     ),
