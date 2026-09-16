@@ -133,12 +133,23 @@ interface ClaudeUsage {
   cache_read_input_tokens?: number;
 }
 
+// Number() on every field, because these arrive from two different places with
+// two different types. Straight off the Anthropic response they are numbers;
+// read back out of pipeline_daily_usage they are bigint columns, which
+// postgres.js returns as STRINGS to avoid losing precision. This expression
+// happens to survive that because it multiplies each field before adding
+// anything, and "10354" * 1 is 10354 while "10354" + "20236" is "1035420236".
+// That is luck, not design - reordering these terms so two token counts are
+// added first would silently report a spend three orders of magnitude too high
+// and halt the pipeline. It cost a debugging session in admin-detect-channels,
+// which did add first.
 function estimateCostUsd(u: ClaudeUsage): number {
+  const n = (v: unknown) => Number(v ?? 0) || 0;
   return (
-    ((u.input_tokens ?? 0) * PRICE_PER_MTOK.input +
-      (u.output_tokens ?? 0) * PRICE_PER_MTOK.output +
-      (u.cache_creation_input_tokens ?? 0) * PRICE_PER_MTOK.cacheWrite +
-      (u.cache_read_input_tokens ?? 0) * PRICE_PER_MTOK.cacheRead) / 1_000_000
+    (n(u.input_tokens) * PRICE_PER_MTOK.input +
+      n(u.output_tokens) * PRICE_PER_MTOK.output +
+      n(u.cache_creation_input_tokens) * PRICE_PER_MTOK.cacheWrite +
+      n(u.cache_read_input_tokens) * PRICE_PER_MTOK.cacheRead) / 1_000_000
   );
 }
 

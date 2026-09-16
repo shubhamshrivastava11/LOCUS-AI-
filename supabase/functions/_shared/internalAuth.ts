@@ -36,12 +36,26 @@ async function secretsMatch(a: string, b: string): Promise<boolean> {
   return diff === 0;
 }
 
+/**
+ * x-internal-key is checked FIRST, and the order is load-bearing.
+ *
+ * Supabase's own gateway sits in front of these functions and wants an
+ * `Authorization: Bearer <supabase key>` (or `apikey`) header of its own before
+ * it will route anything. So a caller who has to satisfy both ends up sending
+ * the platform's key in Authorization and the internal secret in
+ * x-internal-key - and with Authorization checked first, the platform key was
+ * read as the presented secret and every such call was rejected as
+ * unauthorised. Correct outcome, useless reason.
+ *
+ * Authorization is still accepted, for callers that reach the function
+ * directly without the gateway in between.
+ */
 function presentedKey(req: Request): string {
+  const direct = (req.headers.get("x-internal-key") ?? "").trim();
+  if (direct) return direct;
+
   const header = req.headers.get("Authorization") ?? "";
-  const bearer = header.toLowerCase().startsWith("bearer ")
-    ? header.slice(7).trim()
-    : "";
-  return bearer || (req.headers.get("x-internal-key") ?? "").trim();
+  return header.toLowerCase().startsWith("bearer ") ? header.slice(7).trim() : "";
 }
 
 /**
