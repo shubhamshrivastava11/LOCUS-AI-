@@ -20,7 +20,7 @@
 
 import { withAdmin, withTenant } from "../_shared/db.ts";
 import { requireInternalKey } from "../_shared/internalAuth.ts";
-import { loadCallerAuthz } from "../_shared/permissions.ts";
+import { clearanceForLevel, filterVisibleRecords, loadCallerAuthz } from "../_shared/permissions.ts";
 import { resolvePermissionScopes } from "../_shared/tenantAuth.ts";
 
 const RESEND_API_KEY = Deno.env.get("RESEND_API_KEY") ?? "";
@@ -29,6 +29,47 @@ const DAILY_SPEND_CAP_USD = Number(Deno.env.get("AI_DAILY_SPEND_CAP_USD") ?? "1"
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL") ?? "";
 
 type Status = "pass" | "warn" | "fail";
+
+type Usage = {
+  input_tokens?: number;
+  output_tokens?: number;
+  cache_creation_input_tokens?: number;
+  cache_read_input_tokens?: number;
+};
+
+/** Number() on every field: these arrive as numbers from the API and as
+ * strings from postgres, and adding two bigint-shaped strings concatenates. */
+function costUsdFromUsage(u: Usage): number {
+  const n = (v: unknown) => Number(v ?? 0) || 0;
+  const input = n(u.input_tokens) + n(u.cache_creation_input_tokens) + n(u.cache_read_input_tokens);
+  return (input / 1e6) * 1.0 + (n(u.output_tokens) / 1e6) * 5.0;
+}
+
+/** The deep probe pays for model calls, so it books them against the same
+ * ceiling ingestion answers to rather than spending invisibly. */
+async function recordUsage(u: Usage): Promise<void> {
+  try {
+    await withAdmin(async (sql) => {
+      await sql`
+        insert into public.pipeline_daily_usage as p (
+          usage_date, input_tokens, output_tokens,
+          cache_creation_input_tokens, cache_read_input_tokens, request_count
+        ) values (
+          current_date, ${u.input_tokens ?? 0}, ${u.output_tokens ?? 0},
+          ${u.cache_creation_input_tokens ?? 0}, ${u.cache_read_input_tokens ?? 0}, 1
+        )
+        on conflict (usage_date) do update set
+          input_tokens = p.input_tokens + excluded.input_tokens,
+          output_tokens = p.output_tokens + excluded.output_tokens,
+          cache_creation_input_tokens = p.cache_creation_input_tokens + excluded.cache_creation_input_tokens,
+          cache_read_input_tokens = p.cache_read_input_tokens + excluded.cache_read_input_tokens,
+          request_count = p.request_count + 1
+      `;
+    });
+  } catch (err) {
+    console.error("could not record probe usage:", err);
+  }
+}
 
 type Check = {
   name: string;
@@ -156,19 +197,73 @@ async function permissionCanary(): Promise<
     const visible = Number(rows[0]?.n ?? 0);
     const expected = Number(b.expected_visible);
 
+    // The TypeScript half of the same rule, over the same records.
+    //
+    // This is the comparison the canary exists for. The rule is implemented
+    // twice on purpose - filterVisibleRecords for search, a SQL fragment for
+    // the paginated list, because filtering a page after LIMIT would hand back
+    // short pages - and two implementations of one rule drift apart silently.
+    // Neither is authoritative over the other, so a disagreement is a failure
+    // whichever one is right.
+    //
+    // Bounded because it materialises rows: a canary tenant is a fixture of
+    // known size, and if one ever grows past this the honest answer is to say
+    // so rather than to quietly stop comparing.
+    const corpus = await withTenant(b.tenant_id, async (sql) =>
+      await sql`
+        select permission_scope, classification
+        from public.decisions
+        where tenant_id = ${b.tenant_id}::uuid and superseded_by is null
+        limit 2000
+      `
+    ) as unknown as { permission_scope: string[] | null; classification: number | null }[];
+
+    const tsVisible = corpus.length >= 2000
+      ? null
+      : filterVisibleRecords(corpus, scopes, authz).length;
+
     results.push({
       label: b.label,
       role: authz.role,
       role_level: authz.roleLevel,
       clearance: authz.clearance,
       expected,
-      visible,
+      visible_sql: visible,
+      visible_ts: tsVisible,
     });
+
+    if (tsVisible !== null && tsVisible !== visible) {
+      problems.push(
+        `${b.label}: the two implementations of the access rule disagree - ` +
+          `SQL says ${visible}, TypeScript says ${tsVisible}`,
+      );
+    }
 
     if (visible !== expected) {
       problems.push(
         `${b.label} sees ${visible}, expected ${expected}` +
           (visible < expected ? " (too few)" : " (TOO MANY)"),
+      );
+    }
+
+    // Corpus-independent invariants. The baseline above is an absolute count
+    // and therefore brittle: anything legitimately ingested into a canary
+    // tenant breaks it, and a check that cries wolf gets muted. These hold for
+    // any corpus of any size, so they keep working when the baseline needs
+    // re-cutting - and between them they cover the direction that actually
+    // costs something, which is content reaching someone who should not have
+    // it.
+    const overClearance = corpus.filter((r) =>
+      (r.classification ?? 1) > authz.clearance &&
+      filterVisibleRecords([r], scopes, authz).length > 0
+    ).length;
+    if (overClearance > 0) {
+      problems.push(`${b.label} can reach ${overClearance} records above clearance ${authz.clearance}`);
+    }
+
+    if (authz.clearance !== clearanceForLevel(authz.roleLevel)) {
+      problems.push(
+        `${b.label}: clearance ${authz.clearance} does not match role level ${authz.roleLevel}`,
       );
     }
     // Clearance 0 on anything above a Guest is the exact signature of the
@@ -368,6 +463,179 @@ async function migrationLedger(): Promise<
   };
 }
 
+/**
+ * The one path that cannot be asserted for free.
+ *
+ * Every other check here avoids the model deliberately, which is what lets
+ * them run every ten minutes. The consequence is that retrieval and synthesis
+ * are the least-watched part of the product: embeddings could stop resolving,
+ * the Anthropic key could expire, the forced tool call could start coming back
+ * malformed, and nothing above would notice - the records are all still there
+ * and still correctly permissioned, they just stop being answerable.
+ *
+ * So this one costs money and runs on its own, much slower schedule. Roughly
+ * $0.004 a run: one analyse call, one embedding, one synthesis. Four times a
+ * day is under two cents a month against a $1 daily ceiling.
+ *
+ * It asks a question the canary corpus is guaranteed to answer, and requires a
+ * cited answer rather than merely a 200. A refusal is a failure here: the
+ * corpus demonstrably contains the answer, so "I could not find enough
+ * information" means retrieval is broken even though nothing threw.
+ */
+async function searchAnswers(): Promise<
+  { status: Status; detail: string; observed: Record<string, unknown> }
+> {
+  const baseline = await withAdmin(async (sql) =>
+    await sql`
+      select b.tenant_id, b.user_id, b.label
+      from public.health_canary_baseline b
+      order by b.expected_visible desc limit 1
+    `
+  ) as unknown as { tenant_id: string; user_id: string; label: string }[];
+
+  if (baseline.length === 0) {
+    return { status: "warn", detail: "no canary account to search as", observed: {} };
+  }
+
+  const probe = baseline[0];
+  const question = "What did we decide about the Helsinki office?";
+
+  const started = Date.now();
+  const { scopes, email } = await resolvePermissionScopes(probe.user_id, probe.tenant_id);
+  const authz = await loadCallerAuthz(probe.tenant_id, probe.user_id, email);
+
+  // Straight at the embedding provider and the model, not through /search,
+  // because /search needs a tenant JWT this function cannot mint. Same
+  // providers, same models, same keys - which is where the failures live.
+  const embedResp = await fetch("https://api.voyageai.com/v1/embeddings", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${Deno.env.get("VOYAGE_API_KEY") ?? ""}`,
+      "content-type": "application/json",
+    },
+    body: JSON.stringify({
+      input: [question],
+      model: Deno.env.get("VOYAGE_EMBED_MODEL") ?? "voyage-4-large",
+      input_type: "query",
+    }),
+  });
+  if (!embedResp.ok) {
+    return {
+      status: "fail",
+      detail: `embedding provider returned ${embedResp.status} - nothing can be retrieved`,
+      observed: { stage: "embed", http_status: embedResp.status },
+    };
+  }
+  const embedding = (await embedResp.json()).data[0].embedding as number[];
+  const literal = "[" + embedding.join(",") + "]";
+
+  const matches = await withTenant(probe.tenant_id, async (sql) =>
+    await sql`
+      select d.decision_statement, d.rationale, d.permission_scope, d.classification,
+             1 - (de.embedding <=> ${literal}::vector) as similarity
+      from public.decision_embeddings de
+      join public.decisions d on d.id = de.decision_id and d.tenant_id = de.tenant_id
+      where d.tenant_id = ${probe.tenant_id}::uuid and d.superseded_by is null
+      order by de.embedding <=> ${literal}::vector asc
+      limit 8
+    `
+  ) as unknown as {
+    decision_statement: string;
+    rationale: string | null;
+    permission_scope: string[] | null;
+    classification: number | null;
+    similarity: number;
+  }[];
+
+  // Through the real access rule, so a synthesis probe can never quietly read
+  // more than the account it is running as.
+  const permitted = filterVisibleRecords(matches, scopes, authz);
+  if (permitted.length === 0) {
+    return {
+      status: "fail",
+      detail: "retrieval returned nothing this account may read",
+      observed: { stage: "retrieve", candidates: matches.length, permitted: 0 },
+    };
+  }
+
+  const context = permitted
+    .map((m, i) => `Decision ${i + 1}: ${m.decision_statement}${m.rationale ? ` (${m.rationale})` : ""}`)
+    .join("\n");
+
+  const answerResp = await fetch("https://api.anthropic.com/v1/messages", {
+    method: "POST",
+    headers: {
+      "x-api-key": Deno.env.get("ANTHROPIC_API_KEY") ?? "",
+      "anthropic-version": "2023-06-01",
+      "content-type": "application/json",
+    },
+    body: JSON.stringify({
+      model: "claude-haiku-4-5-20251001",
+      max_tokens: 512,
+      temperature: 0,
+      system:
+        "Answer using ONLY the supplied decisions, citing each claim by its decision number. " +
+        "Set sufficient_evidence false if none of them answer the question.",
+      messages: [{ role: "user", content: `Question:\n${question}\n\nContext:\n${context}` }],
+      tools: [{
+        name: "submit_answer",
+        description: "Submit the grounded answer.",
+        input_schema: {
+          type: "object",
+          properties: {
+            sufficient_evidence: { type: "boolean" },
+            answer: { type: "string" },
+            citations: { type: "array", items: { type: "integer" } },
+          },
+          required: ["sufficient_evidence", "answer", "citations"],
+          additionalProperties: false,
+        },
+      }],
+      tool_choice: { type: "tool", name: "submit_answer" },
+    }),
+  });
+
+  if (!answerResp.ok) {
+    return {
+      status: "fail",
+      detail: `model returned ${answerResp.status} - search cannot answer`,
+      observed: { stage: "synthesise", http_status: answerResp.status },
+    };
+  }
+
+  const body = await answerResp.json();
+  const usage = (body.usage ?? {}) as Usage;
+  await recordUsage(usage);
+
+  const block = (body.content ?? []).find((c: { type: string }) => c.type === "tool_use");
+  const out = (block?.input ?? {}) as {
+    sufficient_evidence?: boolean;
+    answer?: string;
+    citations?: number[];
+  };
+  const ms = Date.now() - started;
+
+  const answered = out.sufficient_evidence === true &&
+    typeof out.answer === "string" && out.answer.length > 20 &&
+    Array.isArray(out.citations) && out.citations.length > 0;
+
+  return {
+    status: answered ? (ms > 20000 ? "warn" : "pass") : "fail",
+    detail: answered
+      ? `answered with ${out.citations?.length} citations in ${ms}ms` +
+        (ms > 20000 ? " - slower than it should be" : "")
+      : "search refused a question the canary corpus demonstrably answers",
+    observed: {
+      latency_ms: ms,
+      candidates: matches.length,
+      permitted: permitted.length,
+      citations: out.citations?.length ?? 0,
+      cost_usd: Number(costUsdFromUsage(usage).toFixed(5)),
+      as_account: probe.label,
+    },
+  };
+}
+
 // ── Recording, and alerting on change ────────────────────────────────────
 
 async function record(checks: Check[]): Promise<Record<string, unknown>[]> {
@@ -484,6 +752,16 @@ Deno.serve(async (req: Request) => {
   // A monitor has to be the lightest thing on the system it watches, or it
   // becomes a cause of the incidents it is meant to report. Sequential also
   // makes each duration_ms mean what it says.
+  // The deep probe is opt-in per request, because it is the only check that
+  // costs money. Its own cron runs it every six hours; the ten-minute cron
+  // leaves it out.
+  let body: { deep?: boolean } = {};
+  try {
+    body = await req.json();
+  } catch {
+    body = {};
+  }
+
   const checks: Check[] = [];
   for (const [name, fn] of [
     ["permission_canary", permissionCanary],
@@ -494,6 +772,10 @@ Deno.serve(async (req: Request) => {
     ["migration_ledger", migrationLedger],
   ] as const) {
     checks.push(await timed(name, fn));
+  }
+
+  if (body.deep === true) {
+    checks.push(await timed("search_answers", searchAnswers));
   }
 
   const transitions = await record(checks);

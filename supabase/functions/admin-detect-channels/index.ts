@@ -587,8 +587,30 @@ async function exploreTenant(
       if (!pair) continue;
       if (!d.implies_unstated_fact || !d.fact) continue;
       if (Number(d.confidence) < minConfidence) continue;
+      // Sorted, so the same pair found by a later or overlapping sweep
+      // collides with this row instead of duplicating it.
+      const ids = [pair.a_id, pair.b_id].sort();
+
+      // Persisted as it is found, not accumulated and written at the end. A
+      // sweep is long enough that the process driving it can die mid-run, and
+      // the first real one did exactly that - 60 of 106 candidates survived
+      // only in a log file.
+      await withTenant(tenantId, async (sql) => {
+        await sql`
+          insert into public.candidate_channels
+            (tenant_id, decision_ids, statement, sensitivity, confidence, similarity)
+          values (${tenantId}::uuid, ${ids}::uuid[], ${d.fact},
+                  ${d.sensitivity}, ${Number(d.confidence)}, ${Number(pair.similarity)})
+          on conflict (tenant_id, decision_ids) do update set
+            statement = excluded.statement,
+            sensitivity = excluded.sensitivity,
+            confidence = excluded.confidence,
+            detected_at = now()
+        `;
+      });
+
       found.push({
-        decision_ids: [pair.a_id, pair.b_id],
+        decision_ids: ids,
         similarity: Number(pair.similarity),
         fact: d.fact,
         sensitivity: d.sensitivity,

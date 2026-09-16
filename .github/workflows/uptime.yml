@@ -1,0 +1,101 @@
+# The check that runs outside the system it watches.
+#
+# admin-health runs on pg_cron, inside the Supabase project, and therefore
+# cannot report the one failure that matters most: the project being gone. If
+# Supabase is down, cron does not fire, no alert is sent, and silence is
+# indistinguishable from health - which is precisely the failure mode the whole
+# health system exists to remove. An internal monitor can only ever tell you
+# "running and answering wrongly", never "absent".
+#
+# GitHub Actions is somewhere else. That is its entire qualification for this
+# job, and it is enough. A failed run emails whoever is watching the repository
+# without any additional service to sign up for or pay for.
+#
+# Five minutes is the floor GitHub's scheduler honours in practice, and
+# scheduled runs on a busy instance are routinely late by several minutes. That
+# is fine here: this is a floor under the internal checks, not a replacement for
+# them, and the failure it catches does not resolve itself while you wait.
+
+name: Uptime
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+
+# A long-running deploy and a health ping have nothing to say to each other,
+# and cancelling either because the other is running would hide a real signal.
+concurrency:
+  group: uptime
+  cancel-in-progress: false
+
+jobs:
+  ping:
+    name: Is the product up and answering correctly
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Ask admin-health
+        env:
+          INTERNAL_KEY: ${{ secrets.INTERNAL_FUNCTION_KEY }}
+          PROJECT_REF: imazdfzxinltbgktrgmv
+        run: |
+          set -uo pipefail
+
+          if [ -z "${INTERNAL_KEY:-}" ]; then
+            echo "::error::INTERNAL_FUNCTION_KEY is not set as a repository secret."
+            echo "Add it under Settings > Secrets and variables > Actions, using the"
+            echo "same value as the INTERNAL_FUNCTION_KEY Edge Function secret."
+            exit 1
+          fi
+
+          URL="https://${PROJECT_REF}.supabase.co/functions/v1/admin-health"
+
+          # Retried, because one dropped request is a network blip and not an
+          # outage, and an uptime check that pages on a single failed TCP
+          # connection gets muted within a week. Three consecutive failures
+          # over ninety seconds is a real signal.
+          attempt=0
+          while [ "$attempt" -lt 3 ]; do
+            attempt=$((attempt + 1))
+            CODE=$(curl -sS -o response.json -w '%{http_code}' \
+              --max-time 150 \
+              -X POST "$URL" \
+              -H 'Content-Type: application/json' \
+              -H "x-internal-key: ${INTERNAL_KEY}" \
+              -d '{}' || echo "000")
+
+            if [ "$CODE" = "200" ]; then
+              echo "All checks passing."
+              python3 -c "
+          import json
+          d = json.load(open('response.json'))
+          for c in d['checks']:
+              print('  %-28s %-4s %s' % (c['name'], c['status'], c['detail'][:70]))
+          "
+              exit 0
+            fi
+
+            echo "attempt ${attempt}: HTTP ${CODE}"
+            [ "$attempt" -lt 3 ] && sleep 30
+          done
+
+          echo "::error::admin-health returned ${CODE} after 3 attempts."
+
+          # 503 means the system answered and something it asserts is false, so
+          # the body names it. Anything else - 000, 5xx from the gateway - means
+          # nothing answered at all, which is the case only this workflow can
+          # see.
+          if [ "$CODE" = "503" ]; then
+            python3 -c "
+          import json
+          d = json.load(open('response.json'))
+          for c in d['checks']:
+              if c['status'] != 'pass':
+                  print('::error::%s is %s - %s' % (c['name'], c['status'], c['detail']))
+          " || cat response.json
+          else
+            echo "::error::No usable response. The project itself may be unreachable."
+            cat response.json 2>/dev/null || true
+          fi
+          exit 1
