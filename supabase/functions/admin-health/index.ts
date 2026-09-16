@@ -738,9 +738,98 @@ async function alert(transitions: Record<string, unknown>[]): Promise<boolean> {
   }
 }
 
+/**
+ * The verdict, without re-running anything. What an uptime pinger reads.
+ *
+ * Running the full battery takes around 45 seconds, and free uptime tiers
+ * typically time out at 30 - so pointing a pinger at the working endpoint
+ * would have reported the product down every five minutes forever. That is
+ * worse than no monitor: it is a monitor that trains you to ignore it.
+ *
+ * Splitting the two is the right shape regardless. Cron does the work on a
+ * schedule; the pinger reads the last verdict in a single indexed query. A
+ * monitor should cost its subject almost nothing, and this costs one row read.
+ *
+ * It also turns the pinger into a dead-man's switch, which is the part an
+ * internal monitor genuinely cannot do for itself. If cron stops firing -
+ * because the project is unreachable, because pg_cron is wedged, because a
+ * migration broke the job - the stored results simply stop being refreshed.
+ * Silence would read as health. So staleness is itself a failure here: results
+ * older than STALE_AFTER_MS mean nobody has checked recently, and that is
+ * reported as down rather than as the last known good answer.
+ */
+const STALE_AFTER_MS = 25 * 60 * 1000; // two and a half missed ten-minute runs
+
+async function cachedVerdict(): Promise<Response> {
+  const rows = await withAdmin(async (sql) =>
+    await sql`
+      select name, status, detail, last_run_at
+      from public.health_checks
+      order by case status when 'fail' then 0 when 'warn' then 1 else 2 end, name
+    `
+  ) as unknown as { name: string; status: string; detail: string; last_run_at: string }[];
+
+  if (rows.length === 0) {
+    return new Response(
+      JSON.stringify({ status: "unknown", detail: "no checks have ever run" }),
+      { status: 503, headers: { "content-type": "application/json" } },
+    );
+  }
+
+  const newest = Math.max(...rows.map((r) => new Date(r.last_run_at).getTime()));
+  const ageMs = Date.now() - newest;
+  const stale = ageMs > STALE_AFTER_MS;
+
+  const worst = rows.some((r) => r.status === "fail")
+    ? "fail"
+    : rows.some((r) => r.status === "warn")
+    ? "warn"
+    : "pass";
+
+  const down = stale || worst === "fail";
+
+  return new Response(
+    JSON.stringify({
+      status: stale ? "stale" : worst,
+      // The number that matters when this is stale: how long nobody has been
+      // looking. Reported in both states so a human reading the body during a
+      // recovery can see how long the gap was.
+      last_checked_at: new Date(newest).toISOString(),
+      age_seconds: Math.round(ageMs / 1000),
+      detail: stale
+        ? `No health check has run for ${Math.round(ageMs / 60000)} minutes. ` +
+          `Either the scheduler has stopped or the project was unreachable.`
+        : `${rows.filter((r) => r.status === "pass").length} of ${rows.length} checks passing`,
+      checks: rows.map((r) => ({ name: r.name, status: r.status, detail: r.detail })),
+    }),
+    {
+      status: down ? 503 : 200,
+      headers: { "content-type": "application/json" },
+    },
+  );
+}
+
 Deno.serve(async (req: Request) => {
   const auth = await requireInternalKey(req);
   if (auth) return auth;
+
+  // A GET reads the last verdict; a POST runs the checks. Split on the method
+  // rather than on a flag because an uptime service sends a GET and very often
+  // cannot be made to send anything else.
+  if (req.method === "GET") {
+    try {
+      return await cachedVerdict();
+    } catch (err) {
+      // A monitor that cannot read its own results is down, not silent.
+      return new Response(
+        JSON.stringify({
+          status: "fail",
+          detail: `could not read health state: ${err instanceof Error ? err.message : String(err)}`,
+        }),
+        { status: 503, headers: { "content-type": "application/json" } },
+      );
+    }
+  }
 
   // Sequentially, not with Promise.all, and that is a deliberate downgrade.
   // The database client keeps a pool of three connections per isolate against
