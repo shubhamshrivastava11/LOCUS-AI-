@@ -10,14 +10,25 @@
 # `git push` on somebody's laptop never fires and the org silently falls
 # behind - exactly the divergence that makes two-repo setups rot.
 #
-# Credential: an SSH deploy key with write access to the org repo ONLY, whose
-# private half is the MIRROR_SSH_KEY secret here. Deliberately not a personal
-# access token, which would grant this workflow access to every repository the
-# account can reach. If this key ever leaks, the blast radius is one repo and
-# revoking it is one click in that repo's Deploy keys settings.
+# Credential: a FINE-GRAINED personal access token scoped to
+# LOCUS-AI-APP/LOCUS-AI- alone, with Contents and Workflows set to write,
+# stored here as the MIRROR_TOKEN secret.
 #
-# No loop risk: the org repo has no mirror workflow of its own, so nothing
-# pushes back.
+# An SSH deploy key was tried first and is the better credential in every
+# respect but the one that decides it: GitHub refuses to let a deploy key
+# create or modify anything under .github/workflows/, and this mirror has to
+# carry workflow files or the org's CI quietly rots into a copy of whatever
+# the workflows looked like the day the mirror was set up. A fine-grained
+# token is the tightest credential that can actually do the job - unlike a
+# classic PAT it reaches exactly one repository, so a leak is still a
+# one-repo problem and revoking it is one click.
+#
+# No loop risk, by construction: this file gets mirrored too, so the org repo
+# ends up holding a copy of it. The `if` on the job below means that copy
+# never does anything. Without it every mirrored push would start a job on
+# the org side that pushes the org to itself - harmless, since an identical
+# ref is a no-op and no new push event follows, but it would quietly double
+# the billed job minutes for nothing.
 
 name: Mirror to org
 
@@ -38,6 +49,8 @@ concurrency:
 jobs:
   mirror:
     name: Push main to LOCUS-AI-APP/LOCUS-AI-
+    # Only the source repo mirrors. See the note at the top of this file.
+    if: github.repository == 'Abbas-Rahman-c/locus-ai'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -48,37 +61,35 @@ jobs:
           # ancestry, so the push is rejected as a non-fast-forward against a
           # repo that already has the history.
           fetch-depth: 0
+          # Do not leave the checkout token in .git/config. The push below
+          # uses its own credential, and an unused token sitting in the
+          # working copy is just a second thing that could be misused.
+          persist-credentials: false
 
       - name: Push to the org repo
         env:
-          MIRROR_SSH_KEY: ${{ secrets.MIRROR_SSH_KEY }}
+          MIRROR_TOKEN: ${{ secrets.MIRROR_TOKEN }}
         run: |
           set -euo pipefail
 
-          if [ -z "${MIRROR_SSH_KEY:-}" ]; then
-            echo "::error::MIRROR_SSH_KEY is not set. Add the deploy key's private half"
-            echo "as a repository secret, matching the public key on the org repo."
+          if [ -z "${MIRROR_TOKEN:-}" ]; then
+            echo "::error::MIRROR_TOKEN is not set. Create a fine-grained token scoped"
+            echo "to LOCUS-AI-APP/LOCUS-AI- with Contents: write and Workflows: write,"
+            echo "then add it as the MIRROR_TOKEN repository secret."
             exit 1
           fi
 
-          mkdir -p ~/.ssh
-          printf '%s\n' "$MIRROR_SSH_KEY" > ~/.ssh/mirror_key
-          chmod 600 ~/.ssh/mirror_key
-          # Pinning the host key rather than trusting on first use: this runner
-          # is fresh every time, so TOFU would accept whatever answers.
-          ssh-keyscan -t ed25519 github.com >> ~/.ssh/known_hosts 2>/dev/null
-
-          export GIT_SSH_COMMAND="ssh -i ~/.ssh/mirror_key -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes"
-
+          # The token is interpolated into the URL for this one command rather
+          # than written into git config, so it never lands on the runner's
+          # disk. Actions masks it in the log either way; not persisting it is
+          # the stronger of the two guarantees.
+          #
           # A plain push, never --force. If the two repos have genuinely
-          # diverged, this fails loudly and somebody looks at it - which is the
+          # diverged this fails loudly and somebody looks at it, which is the
           # right outcome. A forced mirror would quietly destroy whatever was
           # on the org side, and "quietly destroys things" is precisely the
-          # failure mode worth avoiding in an unattended job.
-          git push git@github.com:LOCUS-AI-APP/LOCUS-AI-.git HEAD:refs/heads/main
+          # failure mode worth avoiding in a job nobody is watching.
+          git push "https://x-access-token:${MIRROR_TOKEN}@github.com/LOCUS-AI-APP/LOCUS-AI-.git" \
+            HEAD:refs/heads/main
 
-          echo "Mirrored $(git rev-parse --short HEAD) to LOCUS-AI-APP/LOCUS-AI-" >> "$GITHUB_STEP_SUMMARY"
-
-      - name: Remove the key from the runner
-        if: always()
-        run: rm -f ~/.ssh/mirror_key
+          echo "Mirrored \`$(git rev-parse --short HEAD)\` to LOCUS-AI-APP/LOCUS-AI-" >> "$GITHUB_STEP_SUMMARY"
