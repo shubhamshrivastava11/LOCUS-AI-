@@ -1,0 +1,84 @@
+# Keeps LOCUS-AI-APP/LOCUS-AI- in step with this repository.
+#
+# This repo is where the team works: branches, pull requests, one required
+# review. The org repo is the private, company-owned copy that gets shown to
+# clients. It runs CI so every commit carries a green check, and its deploy
+# workflows are disabled so a push here does not deploy twice.
+#
+# The gap this closes: a pull request merged through GitHub's web UI is a push
+# that happens on GitHub's servers. Nothing runs locally, so a dual-remote
+# `git push` on somebody's laptop never fires and the org silently falls
+# behind - exactly the divergence that makes two-repo setups rot.
+#
+# Credential: an SSH deploy key with write access to the org repo ONLY, whose
+# private half is the MIRROR_SSH_KEY secret here. Deliberately not a personal
+# access token, which would grant this workflow access to every repository the
+# account can reach. If this key ever leaks, the blast radius is one repo and
+# revoking it is one click in that repo's Deploy keys settings.
+#
+# No loop risk: the org repo has no mirror workflow of its own, so nothing
+# pushes back.
+
+name: Mirror to org
+
+on:
+  push:
+    branches: [main]
+  # So the org can be re-synced by hand after any manual divergence, without
+  # having to invent a commit to trigger it.
+  workflow_dispatch:
+
+concurrency:
+  # Serialised, and NOT cancel-in-progress: two mirror runs racing could push
+  # an older commit last and leave the org behind the newer one. Letting each
+  # finish costs a few seconds and removes that ordering hazard entirely.
+  group: mirror-to-org
+  cancel-in-progress: false
+
+jobs:
+  mirror:
+    name: Push main to LOCUS-AI-APP/LOCUS-AI-
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out full history
+        uses: actions/checkout@v4
+        with:
+          # fetch-depth: 0 is required. The default shallow clone has no
+          # ancestry, so the push is rejected as a non-fast-forward against a
+          # repo that already has the history.
+          fetch-depth: 0
+
+      - name: Push to the org repo
+        env:
+          MIRROR_SSH_KEY: ${{ secrets.MIRROR_SSH_KEY }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${MIRROR_SSH_KEY:-}" ]; then
+            echo "::error::MIRROR_SSH_KEY is not set. Add the deploy key's private half"
+            echo "as a repository secret, matching the public key on the org repo."
+            exit 1
+          fi
+
+          mkdir -p ~/.ssh
+          printf '%s\n' "$MIRROR_SSH_KEY" > ~/.ssh/mirror_key
+          chmod 600 ~/.ssh/mirror_key
+          # Pinning the host key rather than trusting on first use: this runner
+          # is fresh every time, so TOFU would accept whatever answers.
+          ssh-keyscan -t ed25519 github.com >> ~/.ssh/known_hosts 2>/dev/null
+
+          export GIT_SSH_COMMAND="ssh -i ~/.ssh/mirror_key -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes"
+
+          # A plain push, never --force. If the two repos have genuinely
+          # diverged, this fails loudly and somebody looks at it - which is the
+          # right outcome. A forced mirror would quietly destroy whatever was
+          # on the org side, and "quietly destroys things" is precisely the
+          # failure mode worth avoiding in an unattended job.
+          git push git@github.com:LOCUS-AI-APP/LOCUS-AI-.git HEAD:refs/heads/main
+
+          echo "Mirrored $(git rev-parse --short HEAD) to LOCUS-AI-APP/LOCUS-AI-" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Remove the key from the runner
+        if: always()
+        run: rm -f ~/.ssh/mirror_key
