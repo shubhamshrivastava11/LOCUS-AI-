@@ -1,0 +1,136 @@
+# Deploys every pull request to its own Vercel preview URL and posts the link
+# on the PR.
+#
+# The gap this closes: deploy.yml only fires on merge to main and only ever
+# runs `--prod`, so until now no preview existed anywhere. Reviewing a
+# frontend change meant checking the branch out and running it locally, and
+# no amount of Vercel access helped, because there was nothing there to look
+# at.
+#
+# The link lands as a PR comment, so a reviewer needs no Vercel account. That
+# is the point: one fewer paid seat, one fewer credential to share.
+#
+# Deliberately lean. ci.yml already runs on pull_request and does `npm ci`
+# plus `npx tsc -b`, so repeating either here would just buy the same answer
+# twice on a repo that bills per job minute. This job checks out, greps, and
+# hands the source to Vercel.
+#
+# Uses the same three secrets as deploy.yml: VERCEL_TOKEN, VERCEL_ORG_ID,
+# VERCEL_PROJECT_ID. Nothing new to configure.
+
+name: Preview deploy
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened]
+    # A backend-only PR would produce a preview byte-identical to production,
+    # which is a billed minute for no information. Vercel serves the frontend
+    # and nothing else, so only frontend changes are worth previewing.
+    paths:
+      - 'frontend/**'
+      - '.github/workflows/preview.yml'
+
+concurrency:
+  # Per pull request, and cancel-in-progress is right here where it is wrong
+  # for the mirror: pushing a fixup makes the previous preview obsolete, so
+  # killing that build saves a minute and avoids an older deploy landing last
+  # and commenting a stale URL.
+  group: vercel-preview-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  preview:
+    name: Deploy PR preview
+    # A pull request opened from a fork gets no secrets, so the deploy would
+    # fail on an empty token with an error that blames Vercel rather than the
+    # actual cause. Everyone on this repo pushes branches to it directly, so
+    # skipping forks costs nothing and keeps the failure honest.
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      # Same guard as deploy.yml, and cheaper to trip here. Vercel's Root
+      # Directory for this project is `frontend`, so the build only ever
+      # receives frontend/. An import climbing out of it resolves locally,
+      # where the whole repo exists, then fails on Vercel with TS2307.
+      - name: No imports outside the deploy root
+        run: |
+          if grep -rnE "from +['\"]\.\./\.\./\.\./" frontend/src frontend/landing-page; then
+            echo "::error::An import above frontend/ will not exist in the Vercel build."
+            exit 1
+          fi
+          echo "No imports escape frontend/."
+
+      - name: Deploy preview
+        id: deploy
+        env:
+          VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
+          VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${VERCEL_TOKEN:-}" ]; then
+            echo "::error::VERCEL_TOKEN is not set on this repository."
+            exit 1
+          fi
+
+          # No --prod, which is the whole difference from deploy.yml: this
+          # creates a preview deployment on its own URL and never touches
+          # locusaiapp.com. Also no --prebuilt, for the same reason deploy.yml
+          # avoids it - letting Vercel build keeps the VITE_* values in the
+          # Vercel project alone rather than copied into GitHub secrets too.
+          npx vercel@latest deploy --yes --logs --token="$VERCEL_TOKEN" \
+            > preview-url.txt
+
+          URL="$(tail -n 1 preview-url.txt)"
+          echo "url=$URL" >> "$GITHUB_OUTPUT"
+          echo "Preview: $URL"
+          {
+            echo "### Preview deploy"
+            echo ""
+            echo "$URL"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Comment the URL on the PR
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          URL: ${{ steps.deploy.outputs.url }}
+          PR: ${{ github.event.pull_request.number }}
+          SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+
+          # A hidden marker so each push edits the one comment instead of
+          # adding another. A PR with fifteen pushes should carry one link
+          # that is current, not fifteen links of which fourteen are dead.
+          MARKER='<!-- locus-preview-deploy -->'
+
+          # Built with printf rather than a literal multi-line string: the
+          # continuation lines of one of those have to start at column 0,
+          # which escapes this `run: |` block and makes the file invalid
+          # YAML. The format string is single-quoted so the backticks stay
+          # literal instead of running as a command.
+          BODY="$(printf '%s\n**Preview deploy** for `%s`\n\n%s\n\nUpdated on every push to this PR. This is a preview, not production.' \
+            "$MARKER" "${SHA:0:7}" "$URL")"
+
+          ID="$(gh api "repos/${GITHUB_REPOSITORY}/issues/${PR}/comments" \
+                  --paginate --jq ".[] | select(.body | contains(\"$MARKER\")) | .id" \
+                | head -n 1)"
+
+          if [ -n "$ID" ]; then
+            gh api -X PATCH "repos/${GITHUB_REPOSITORY}/issues/comments/${ID}" \
+              -f body="$BODY" --silent
+            echo "Updated comment $ID."
+          else
+            gh api -X POST "repos/${GITHUB_REPOSITORY}/issues/${PR}/comments" \
+              -f body="$BODY" --silent
+            echo "Posted a new comment."
+          fi
