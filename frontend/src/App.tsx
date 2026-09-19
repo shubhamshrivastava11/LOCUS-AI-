@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { Suspense, lazy, useEffect, useState } from 'react'
 import type { Session } from '@supabase/supabase-js'
 import {
   BrowserRouter,
@@ -13,8 +13,6 @@ import {
 import LandingPage from '../landing-page/LandingPage'
 import WelcomePage from '../landing-page/WelcomePage'
 import HowItWorks from '../landing-page/HowItWorks'
-import ConnectWorkspaces from './ConnectWorkspaces'
-import JoinTeam from './JoinTeam'
 import OAuthCallback from './OAuthCallback'
 import SourceOAuthCallback from './SourceOAuthCallback'
 import { getSupabaseClient, isSupabaseConfigured } from './lib/supabase'
@@ -26,12 +24,25 @@ import { fetchSourceConnections } from './lib/sourceConnections'
 import DecisionReady from './DecisionReady'
 import { DashboardShell } from './components/DashboardShell'
 import { TermsGateModal } from './components/TermsGateModal'
-import MainDashboardEntry from './pages/MainDashboardEntry'
-import DecisionLogPage from './pages/DecisionLogPage'
-import TeamPulse from './pages/TeamPulse'
-import SettingsPage from './pages/SettingsPage'
-import TermsPage from './pages/TermsPage'
 import { TERMS_VERSION } from './lib/termsContent'
+
+// Everything past the landing page is split out of the first download.
+//
+// The whole app used to ship as one 674 kB bundle, which meant somebody
+// arriving at locusaiapp.com waited for SettingsPage (2,383 lines), TeamPulse,
+// the Memory Explorer and the dashboard before the marketing page could
+// paint - four screens they cannot even reach until they sign in.
+//
+// Split by the only boundary that matters here, which is the login wall.
+// LandingPage stays eagerly imported because it IS the first paint; making
+// it lazy would only add a round trip before anything appears.
+const ConnectWorkspaces = lazy(() => import('./ConnectWorkspaces'))
+const JoinTeam = lazy(() => import('./JoinTeam'))
+const MainDashboardEntry = lazy(() => import('./pages/MainDashboardEntry'))
+const DecisionLogPage = lazy(() => import('./pages/DecisionLogPage'))
+const TeamPulse = lazy(() => import('./pages/TeamPulse'))
+const SettingsPage = lazy(() => import('./pages/SettingsPage'))
+const TermsPage = lazy(() => import('./pages/TermsPage'))
 
 /** Full marketing page: Get Started → How it works → Why Locus (scrollable). */
 function HowItWorksMarketing() {
@@ -512,10 +523,20 @@ const PAGE_TITLES: Record<string, string> = {
   '/terms': 'Terms of Service · Locus AI',
 }
 
+// Whatever index.html shipped with, read once at module load before any
+// route has had a chance to overwrite it. The fallback used to be the
+// literal string "Locus AI - Sign up", which meant React replaced the real
+// title with "Sign up" the moment it mounted on "/" - a visitor on the
+// landing page saw a tab labelled for a screen they were not on, and the
+// static tag and the running app disagreed. Deriving the fallback keeps
+// index.html the single source of truth.
+const DEFAULT_TITLE =
+  typeof document === 'undefined' ? 'Locus AI' : document.title
+
 function PageTitle() {
   const location = useLocation()
   useEffect(() => {
-    document.title = PAGE_TITLES[location.pathname] ?? 'Locus AI - Sign up'
+    document.title = PAGE_TITLES[location.pathname] ?? DEFAULT_TITLE
   }, [location.pathname])
   return null
 }
@@ -524,6 +545,19 @@ function App() {
   return (
     <BrowserRouter>
       <PageTitle />
+      {/* One boundary around the whole table rather than one per lazy route:
+          only a single route renders at a time, so a shared fallback behaves
+          identically and there is no chance of a new lazy route being added
+          without one. The markup matches the loading state AuthRoutes already
+          shows, so a chunk fetch looks like the session check that usually
+          precedes it instead of a second, different flash. */}
+      <Suspense
+        fallback={
+          <main className="flex min-h-screen items-center justify-center bg-white text-sm text-[#6B7280]">
+            Loading…
+          </main>
+        }
+      >
       <Routes>
         <Route path="/" element={<AuthRoutes />} />
         <Route path="/welcome" element={<WelcomePage />} />
@@ -555,6 +589,7 @@ function App() {
 
         <Route path="*" element={<Navigate to="/" replace />} />
       </Routes>
+      </Suspense>
     </BrowserRouter>
   )
 }
