@@ -105,6 +105,7 @@ jobs:
           URL: ${{ steps.deploy.outputs.url }}
           PR: ${{ github.event.pull_request.number }}
           SHA: ${{ github.event.pull_request.head.sha }}
+          BYPASS: ${{ secrets.VERCEL_BYPASS_SECRET }}
         run: |
           set -euo pipefail
 
@@ -113,13 +114,36 @@ jobs:
           # that is current, not fifteen links of which fourteen are dead.
           MARKER='<!-- locus-preview-deploy -->'
 
+          # Vercel protects preview deployments with its own SSO by default,
+          # so the bare URL redirects to vercel.com/sso-api and only opens
+          # for someone already logged into the team. That is exactly the
+          # barrier this job exists to remove, so the link carries a
+          # Protection Bypass for Automation token when one is configured.
+          #
+          # The tradeoff, stated plainly: the token is visible in the comment
+          # to anyone who can read this PR, and it bypasses protection on
+          # every deployment in the project. That is acceptable here only
+          # because the repository is private and its readers are the team.
+          # If this repo is ever made public, remove VERCEL_BYPASS_SECRET.
+          #
+          # x-vercel-set-bypass-cookie turns the token into a cookie on the
+          # first request, so navigating inside the preview keeps working
+          # instead of bouncing to SSO on the second page.
+          if [ -n "${BYPASS:-}" ]; then
+            LINK="${URL}?x-vercel-protection-bypass=${BYPASS}&x-vercel-set-bypass-cookie=true"
+            ACCESS='Opens directly, no Vercel account needed.'
+          else
+            LINK="$URL"
+            ACCESS='Needs a Vercel login, because Vercel SSO protects previews by default. Add a `VERCEL_BYPASS_SECRET` repository secret to make this link open for everyone.'
+          fi
+
           # Built with printf rather than a literal multi-line string: the
           # continuation lines of one of those have to start at column 0,
           # which escapes this `run: |` block and makes the file invalid
           # YAML. The format string is single-quoted so the backticks stay
           # literal instead of running as a command.
-          BODY="$(printf '%s\n**Preview deploy** for `%s`\n\n%s\n\nUpdated on every push to this PR. This is a preview, not production.' \
-            "$MARKER" "${SHA:0:7}" "$URL")"
+          BODY="$(printf '%s\n**Preview deploy** for `%s`\n\n%s\n\n%s\n\nUpdated on every push to this PR. This is a preview, not production.' \
+            "$MARKER" "${SHA:0:7}" "$LINK" "$ACCESS")"
 
           ID="$(gh api "repos/${GITHUB_REPOSITORY}/issues/${PR}/comments" \
                   --paginate --jq ".[] | select(.body | contains(\"$MARKER\")) | .id" \
