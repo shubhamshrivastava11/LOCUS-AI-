@@ -19,6 +19,12 @@
 // No infinite loop - the cron interval is the poll loop.
 
 import { withAdmin, withTenant } from "../_shared/db.ts";
+import {
+  type ClassificationRule,
+  planRouting,
+  resolveClassification,
+  type RoutingRule,
+} from "../_shared/rules.ts";
 import { decryptToken } from "../_shared/tokenCrypto.ts";
 import { redactFinancialInfo } from "../_shared/financialRedaction.ts";
 import { cleanDisplayText } from "../_shared/htmlText.ts";
@@ -1081,6 +1087,155 @@ async function isCaptureExcluded(
   }
 }
 
+/** One row of routing_audit, held until the tenant transaction releases. */
+type RoutingAuditRow = {
+  ruleId: string;
+  ruleName: string;
+  sourceDecisionId: string;
+  derivedDecisionId: string;
+  fromDepartment: string;
+  toDepartment: string;
+  purpose: string;
+  sourceClassification: number;
+  emittedClassification: number;
+  carriedFields: string[];
+  withheldFields: string[];
+};
+
+/**
+ * Emits the derived records a routing rule calls for, and returns the audit
+ * rows describing what crossed.
+ *
+ * Runs on the tenant lane inside the same transaction as the source record,
+ * so a derived record cannot survive a source that rolled back. The audit
+ * rows go back to the caller rather than being written here, because
+ * routing_audit is admin-lane only.
+ *
+ * Note what does NOT cross: the derived record carries only the allowlisted
+ * fields, and its permission_scope is the DESTINATION department's scopes,
+ * not the source's. Copying the source scopes would hand the destination
+ * department a record scoped to a channel they are not in, which reads as
+ * invisible - a silent no-op that looks like the rule never fired.
+ */
+async function emitRoutedRecords(
+  // deno-lint-ignore no-explicit-any
+  sql: any,
+  tenantId: string,
+  record: {
+    id: string;
+    record_type: string;
+    classification: number;
+    departmentId: string;
+    fields: Record<string, unknown>;
+    isDerived: boolean;
+  },
+  _sourceScopes: string[],
+): Promise<RoutingAuditRow[]> {
+  const ruleRows = await sql`
+    SELECT r.id, r.name, r.from_department_id, r.to_department_id,
+           r.when_record_type, r.when_min_classification, r.emit_classification,
+           r.carry_fields, r.purpose,
+           df.name AS from_name, dt.name AS to_name
+    FROM public.routing_rules r
+    JOIN public.departments df ON df.id = r.from_department_id
+    JOIN public.departments dt ON dt.id = r.to_department_id
+    WHERE r.tenant_id = ${tenantId}
+      AND r.enabled = true
+      AND r.from_department_id = ${record.departmentId}
+  `;
+  if (ruleRows.length === 0) return [];
+
+  const plans = planRouting(ruleRows as unknown as RoutingRule[], record);
+  if (plans.length === 0) return [];
+
+  const nameById = new Map<string, { from: string; to: string }>(
+    ruleRows.map((r: Record<string, unknown>) => [
+      r.id as string,
+      { from: r.from_name as string, to: r.to_name as string },
+    ]),
+  );
+
+  const audit: RoutingAuditRow[] = [];
+
+  for (const plan of plans) {
+    // The destination's own scopes, so the people in that department can
+    // actually see what was routed to them.
+    const destScopes = await sql`
+      SELECT scope_id FROM public.department_scopes
+      WHERE tenant_id = ${tenantId} AND department_id = ${plan.toDepartmentId}
+    `;
+    const scopes = destScopes.map((r: Record<string, unknown>) => r.scope_id as string);
+    // A destination with no mapped scopes would produce a record nobody can
+    // reach. Skipped rather than written, and visible in the logs.
+    if (scopes.length === 0) {
+      console.warn(
+        `routing: "${plan.rule.name}" skipped, destination department has no mapped scopes`,
+      );
+      continue;
+    }
+
+    const statement = typeof plan.fields.decision_statement === "string"
+      ? plan.fields.decision_statement
+      : `${record.record_type} routed from ${nameById.get(plan.rule.id)?.from ?? "another department"}`;
+
+    const inserted = await sql`
+      INSERT INTO public.decisions (
+        tenant_id, record_type, decision_statement, rationale,
+        alternatives_considered, status, scope, confidence, permission_scope,
+        classification, classified_by, classified_at,
+        source_decision_id, routed_purpose, routed_by_rule
+      ) VALUES (
+        ${tenantId}, ${record.record_type}, ${statement},
+        ${typeof plan.fields.rationale === "string" ? plan.fields.rationale : null},
+        ${Array.isArray(plan.fields.alternatives_considered) ? plan.fields.alternatives_considered : []},
+        ${typeof plan.fields.status === "string" ? plan.fields.status : "open"},
+        'team', 1.0, ${scopes},
+        ${plan.classification}, 'routing_rule', now(),
+        ${plan.sourceDecisionId}, ${plan.purpose}, ${plan.rule.id}
+      ) RETURNING id
+    `;
+
+    const names = nameById.get(plan.rule.id);
+    audit.push({
+      ruleId: plan.rule.id,
+      ruleName: plan.rule.name,
+      sourceDecisionId: plan.sourceDecisionId,
+      derivedDecisionId: inserted[0].id as string,
+      fromDepartment: names?.from ?? "unknown",
+      toDepartment: names?.to ?? "unknown",
+      purpose: plan.purpose,
+      sourceClassification: record.classification,
+      emittedClassification: plan.classification,
+      carriedFields: Object.keys(plan.fields).sort(),
+      withheldFields: plan.withheldFields,
+    });
+  }
+
+  return audit;
+}
+
+/** Writes the audit on the admin lane, after the tenant transaction closes. */
+async function writeRoutingAudit(tenantId: string, rows: RoutingAuditRow[]): Promise<void> {
+  await withAdmin(async (sql) => {
+    for (const r of rows) {
+      await sql`
+        INSERT INTO public.routing_audit (
+          tenant_id, rule_id, rule_name, source_decision_id, derived_decision_id,
+          from_department, to_department, purpose,
+          source_classification, emitted_classification,
+          carried_fields, withheld_fields
+        ) VALUES (
+          ${tenantId}::uuid, ${r.ruleId}::uuid, ${r.ruleName},
+          ${r.sourceDecisionId}::uuid, ${r.derivedDecisionId}::uuid,
+          ${r.fromDepartment}, ${r.toDepartment}, ${r.purpose},
+          ${r.sourceClassification}, ${r.emittedClassification},
+          ${r.carriedFields}, ${r.withheldFields}
+        )
+      `;
+    }
+  });
+}
+
 async function handleIngestionMessageInner(msg: PgmqMsg): Promise<string> {
   const payload = msg.message as {
     tenant_id: string; source: string; source_id: string; actor: string;
@@ -1426,6 +1581,16 @@ async function handleIngestionMessageInner(msg: PgmqMsg): Promise<string> {
   extraction.alternatives_considered = (extraction.alternatives_considered ?? []).map(redactFinancialInfo);
 
   // Persist (decision + source + actors), mark done, enqueue embedding
+  // (see emitRoutedRecords and writeRoutingAudit below)
+  // Audit rows for anything routing emits. Collected inside the tenant
+  // transaction and written afterwards, because routing_audit is admin-lane
+  // only - it names source records the reader may have no clearance for, so
+  // it carries no locus_app grant. Opening an admin connection from inside a
+  // tenant transaction would contend for the same small pool that timed out
+  // admin-health, so the write waits until this block has released its
+  // connection.
+  let pendingAudit: RoutingAuditRow[] = [];
+
   const decisionId = await withTenant(tenantId, async (sql) => {
     const existingDecision = await sql`
       SELECT id FROM public.decisions WHERE tenant_id = ${tenantId} AND origin_raw_event_id = ${rawEventId}
@@ -1442,14 +1607,54 @@ async function handleIngestionMessageInner(msg: PgmqMsg): Promise<string> {
       WHERE tenant_id = ${tenantId} AND scope_id = ANY(${payload.permission_scope ?? []}::text[])
     `;
     const scopeFloor = Number(floorRows[0]?.floor ?? 0);
-    const classification = Math.max(proposedLevel, scopeFloor);
-    // Which of the three decided the outcome, recorded so a later reviewer can
-    // tell a deliberate policy from a model guess from an untouched default.
-    const classifiedBy = scopeFloor > proposedLevel
-      ? "scope_floor"
-      : classification === 1 && proposedLevel === 1
-      ? "default"
-      : "model";
+
+    // Which department this record's scope belongs to, if any. Null for every
+    // record until somebody maps a scope in department_scopes, and null is
+    // the inert case: no department default applies and no routing rule can
+    // fire. A tenant that has never touched departments behaves exactly as it
+    // did before this code existed, which is the property that made it safe
+    // to put on the hot path.
+    const deptRows = await sql`
+      SELECT d.id, d.default_classification
+      FROM public.department_scopes ds
+      JOIN public.departments d ON d.id = ds.department_id
+      WHERE ds.tenant_id = ${tenantId}
+        AND ds.scope_id = ANY(${payload.permission_scope ?? []}::text[])
+      ORDER BY d.default_classification DESC
+      LIMIT 1
+    `;
+    const departmentId = (deptRows[0]?.id as string | undefined) ?? null;
+    const departmentDefault = Number(deptRows[0]?.default_classification ?? 0);
+
+    const ruleRows = await sql`
+      SELECT id, name, department_id, match_type, match_terms,
+             set_classification, set_compartment, priority
+      FROM public.classification_rules
+      WHERE tenant_id = ${tenantId} AND enabled = true
+      ORDER BY priority, id
+    `;
+
+    // The engine resolves a max() over every source that can raise the level.
+    // Scope floors and the model proposal are unchanged inputs; departments
+    // and rules are new ones. None of them can lower anything.
+    const outcome = resolveClassification(
+      ruleRows as unknown as ClassificationRule[],
+      {
+        text: [
+          extraction.decision_statement,
+          extraction.rationale ?? "",
+          ...(extraction.alternatives_considered ?? []),
+        ].join("\n"),
+        departmentId,
+        proposedLevel,
+        scopeFloor,
+        departmentDefault,
+      },
+    );
+    const classification = outcome.classification;
+    // Which source decided the outcome, recorded so a later reviewer can tell
+    // a deliberate policy from a model guess from an untouched default.
+    const classifiedBy = outcome.decidedBy;
 
     const decisionRows = await sql`
       INSERT INTO public.decisions (
@@ -1505,9 +1710,35 @@ async function handleIngestionMessageInner(msg: PgmqMsg): Promise<string> {
       }
     }
 
+    // Cross-department routing. Emits NEW records into other departments;
+    // it never touches this one, and it never widens anything. Inert for any
+    // record whose scope is not mapped to a department, which is every
+    // record until a tenant configures one.
+    if (departmentId !== null) {
+      pendingAudit = await emitRoutedRecords(sql, tenantId, {
+        id: newDecisionId,
+        record_type: extraction.record_type,
+        classification,
+        departmentId,
+        fields: {
+          decision_statement: extraction.decision_statement,
+          rationale: extraction.rationale,
+          alternatives_considered: extraction.alternatives_considered,
+          status: extraction.status,
+          record_type: extraction.record_type,
+        },
+        // Records created here are always originals. A derived record is
+        // written by emitRoutedRecords itself and never re-enters this path,
+        // which is what keeps routing to a single hop.
+        isDerived: false,
+      }, payload.permission_scope ?? []);
+    }
+
     await sql`UPDATE public.raw_events SET pipeline_status = 'done' WHERE id = ${rawEventId}`;
     return newDecisionId;
   });
+
+  if (pendingAudit.length > 0) await writeRoutingAudit(tenantId, pendingAudit);
 
   await pgmqSend("embedding_queue", { tenant_id: tenantId, decision_id: decisionId });
   await pgmqDelete("ingestion", msg.msg_id);

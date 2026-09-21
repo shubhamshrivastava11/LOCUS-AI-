@@ -454,6 +454,14 @@ verify_jwt = true
 verify_jwt = true
 
 
+# True, unlike the operator endpoints below. This one writes configuration
+# rather than sweeping records, and it is called by hand a handful of times
+# per tenant rather than by a pinger, so requiring a real Supabase key costs
+# nothing and keeps one fewer endpoint reachable with only a shared secret.
+[functions.admin-seed-departments]
+verify_jwt = true
+
+
 # False for the same reason admin-pipeline-status is: this one authenticates
 # itself with requireInternalKey against INTERNAL_FUNCTION_KEY, which fails
 # closed when the secret is unset. A gateway JWT would prove only that someone
