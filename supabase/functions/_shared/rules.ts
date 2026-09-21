@@ -142,6 +142,24 @@ export type RoutingRule = {
   to_department_id: string;
   when_record_type: string | null;
   when_min_classification: number | null;
+  /**
+   * Fields the source must actually carry for this rule to fire. Empty means
+   * no such requirement.
+   *
+   * Without this, a corridor aimed at a narrow subject fires on everything.
+   * "Infrastructure spend to Finance" is the case that exposed it: it
+   * matches record_type "decision", which is the generic type, and its
+   * allowlist includes decision_statement, which every record has - so it
+   * emitted a Finance record for every Engineering decision ever captured.
+   * Requiring estimated_monthly_cost to be present is what makes it a
+   * spend corridor rather than a firehose.
+   *
+   * Distinct from carry_fields on purpose: what a rule needs in order to be
+   * RELEVANT is not the same as what it is allowed to CARRY, and conflating
+   * them would mean widening a corridor's trigger every time you wanted one
+   * more field to cross.
+   */
+  when_has_fields: string[];
   emit_classification: number;
   carry_fields: string[];
   purpose: string;
@@ -196,6 +214,13 @@ export function routingRuleApplies(rule: RoutingRule, record: RoutableRecord): b
     record.classification < rule.when_min_classification
   ) {
     return false;
+  }
+  // Every named field must be present AND carry something. A field set to
+  // null or an empty string is the source saying "we do not have this",
+  // which should not trigger a corridor that exists because of it.
+  for (const field of rule.when_has_fields ?? []) {
+    const value = record.fields[field];
+    if (value === undefined || value === null || value === "") return false;
   }
   return true;
 }

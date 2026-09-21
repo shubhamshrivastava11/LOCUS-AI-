@@ -142,12 +142,12 @@ Deno.serve(async (req) => {
             await sql`
               INSERT INTO public.routing_rules (
                 tenant_id, name, from_department_id, to_department_id,
-                when_record_type, when_min_classification, emit_classification,
-                carry_fields, purpose
+                when_record_type, when_min_classification, when_has_fields,
+                emit_classification, carry_fields, purpose
               ) VALUES (
                 ${tenantId}::uuid, ${c.name}, ${from}::uuid, ${to}::uuid,
-                ${c.when_record_type}, ${c.when_min_classification}, ${c.emit_classification},
-                ${c.carry_fields}, ${c.purpose}
+                ${c.when_record_type}, ${c.when_min_classification}, ${c.when_has_fields ?? []},
+                ${c.emit_classification}, ${c.carry_fields}, ${c.purpose}
               )
               ON CONFLICT DO NOTHING
             `;

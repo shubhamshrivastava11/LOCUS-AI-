@@ -1133,7 +1133,8 @@ async function emitRoutedRecords(
 ): Promise<RoutingAuditRow[]> {
   const ruleRows = await sql`
     SELECT r.id, r.name, r.from_department_id, r.to_department_id,
-           r.when_record_type, r.when_min_classification, r.emit_classification,
+           r.when_record_type, r.when_min_classification, r.when_has_fields,
+           r.emit_classification,
            r.carry_fields, r.purpose,
            df.name AS from_name, dt.name AS to_name
     FROM public.routing_rules r

@@ -162,6 +162,7 @@ const toFinance: RoutingRule = {
   to_department_id: FIN,
   when_record_type: "offer_accepted",
   when_min_classification: 3,
+  when_has_fields: [],
   emit_classification: 2,
   carry_fields: ["role_title", "band", "start_date", "annualised_cost"],
   purpose: "headcount cost forecasting",

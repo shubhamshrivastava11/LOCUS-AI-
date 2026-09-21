@@ -226,6 +226,7 @@ Deno.test("corridors: opposite pairs exist, and the one-hop guard is what makes 
     to_department_id: "b",
     when_record_type: null,
     when_min_classification: 0,
+    when_has_fields: [],
   };
   const derived: RoutableRecord = {
     id: "d",
@@ -237,6 +238,83 @@ Deno.test("corridors: opposite pairs exist, and the one-hop guard is what makes 
   };
   assertEquals(planRouting([rule], derived).length, 0, "a derived record must not route onward");
   assertEquals(planRouting([rule], { ...derived, isDerived: false }).length, 1);
+});
+
+Deno.test("corridors: a generic-type corridor must narrow itself somehow", () => {
+  // The bug this was written for. "Infrastructure spend to Finance" matched
+  // record_type "decision" - the generic type - and carried
+  // decision_statement, which every record has, so it emitted to Finance for
+  // every Engineering decision ever captured. Nothing was internally
+  // inconsistent; every CHECK constraint passed. The only way to see it was
+  // to ask what the corridor would match in practice.
+  //
+  // So: a corridor on the generic type has to narrow itself by something
+  // other than the record type, or it is a firehose.
+  const GENERIC = new Set(["decision", null]);
+  for (const c of CORRIDORS) {
+    if (!GENERIC.has(c.when_record_type)) continue;
+    const narrowed = (c.when_has_fields?.length ?? 0) > 0 ||
+      (c.when_min_classification ?? 0) >= 2;
+    assertEquals(
+      narrowed,
+      true,
+      `"${c.name}" fires on the generic record type with nothing to narrow it: ` +
+        `it will emit for every record leaving ${c.from}`,
+    );
+  }
+});
+
+Deno.test("corridors: when_has_fields names are a subset of what can cross", () => {
+  // Requiring a field the corridor then withholds is legal but almost
+  // always a mistake: it means the destination gets a record triggered by
+  // something it cannot see. Allowed only where clearly deliberate.
+  for (const c of CORRIDORS) {
+    for (const f of c.when_has_fields ?? []) {
+      assertEquals(
+        c.carry_fields.includes(f),
+        true,
+        `"${c.name}" requires ${f} but does not carry it`,
+      );
+    }
+  }
+});
+
+Deno.test("corridors: which are actually REACHABLE with today's extraction", () => {
+  // The gap this exists to make visible.
+  //
+  // ai-worker passes routing exactly five fields, and the extractor can only
+  // produce three record types. Measured against that, no corridor in the
+  // standard set can emit anything: the ones keyed to offer_accepted or
+  // budget_approval can never match a record type that does not exist, and
+  // the rest carry allowlists that share no field with what is available,
+  // so applyAllowlist returns empty and planRouting skips them.
+  //
+  // Routing is therefore wired, correct, and dormant. That is a reasonable
+  // state to be in - inert is much better than wrong - but it is invisible
+  // from the outside, and "we shipped routing" would be a misleading thing
+  // to say about it. This test states the position and will FAIL the moment
+  // extraction gets richer, which is exactly when somebody needs to know
+  // that corridors just became live.
+  const EXTRACTED_FIELDS = [
+    "decision_statement", "rationale", "alternatives_considered", "status", "record_type",
+  ];
+  const EXTRACTED_TYPES = ["decision", "action_item", "blocker"];
+
+  const reachable = CORRIDORS.filter((c) => {
+    if (c.when_record_type !== null && !EXTRACTED_TYPES.includes(c.when_record_type)) return false;
+    // Every required field must be producible.
+    if ((c.when_has_fields ?? []).some((f) => !EXTRACTED_FIELDS.includes(f))) return false;
+    // And at least one carried field must exist, or nothing is emitted.
+    return c.carry_fields.some((f) => EXTRACTED_FIELDS.includes(f));
+  }).map((c) => c.name);
+
+  assertEquals(
+    reachable,
+    [],
+    "a corridor just became reachable. Routing is now live for it - confirm the " +
+      "allowlist is right, and update the canary baselines, because derived " +
+      "records will change the per-role counts.",
+  );
 });
 
 Deno.test("corridors: every department that produces traffic can also receive it", () => {
