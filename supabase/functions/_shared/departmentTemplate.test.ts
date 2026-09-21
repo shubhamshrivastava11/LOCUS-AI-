@@ -16,6 +16,7 @@ import {
   DEPARTMENTS,
 } from "./departmentTemplate.ts";
 import { planRouting, type RoutableRecord, type RoutingRule } from "./rules.ts";
+import { ALLOWED_ATTRIBUTES } from "./attributes.ts";
 
 // ---------------------------------------------------------------------------
 // The department set
@@ -165,7 +166,9 @@ Deno.test("corridors: the HR to Finance corridor withholds everything identifyin
   };
   const record: RoutableRecord = {
     id: "d1",
-    record_type: "offer_accepted",
+    // "decision" now, not "offer_accepted": the corridor keys on the facts
+    // present rather than on a record type the extractor cannot produce.
+    record_type: "decision",
     classification: 3,
     departmentId: "hr",
     fields: {
@@ -279,41 +282,54 @@ Deno.test("corridors: when_has_fields names are a subset of what can cross", () 
   }
 });
 
-Deno.test("corridors: which are actually REACHABLE with today's extraction", () => {
-  // The gap this exists to make visible.
+Deno.test("corridors: every corridor is reachable with what extraction produces", () => {
+  // This test used to assert the opposite, and the flip is the point.
   //
-  // ai-worker passes routing exactly five fields, and the extractor can only
-  // produce three record types. Measured against that, no corridor in the
-  // standard set can emit anything: the ones keyed to offer_accepted or
-  // budget_approval can never match a record type that does not exist, and
-  // the rest carry allowlists that share no field with what is available,
-  // so applyAllowlist returns empty and planRouting skips them.
+  // Before the extractor learned to emit structured attributes, ai-worker
+  // passed routing four prose fields and a record type, and NO corridor
+  // could emit anything: allowlists named ship_date and estimated_monthly_cost
+  // against records that had no such field to give. Routing was wired,
+  // correct and entirely dormant, and the test said so.
   //
-  // Routing is therefore wired, correct, and dormant. That is a reasonable
-  // state to be in - inert is much better than wrong - but it is invisible
-  // from the outside, and "we shipped routing" would be a misleading thing
-  // to say about it. This test states the position and will FAIL the moment
-  // extraction gets richer, which is exactly when somebody needs to know
-  // that corridors just became live.
+  // Now it asserts the inverse invariant: a corridor that cannot fire is
+  // dead configuration, and dead configuration is worse than none because it
+  // reads as coverage. If this fails, either a corridor gained a condition
+  // extraction cannot satisfy, or a key was dropped from the whitelist.
   const EXTRACTED_FIELDS = [
     "decision_statement", "rationale", "alternatives_considered", "status", "record_type",
+    ...ALLOWED_ATTRIBUTES,
   ];
   const EXTRACTED_TYPES = ["decision", "action_item", "blocker"];
 
-  const reachable = CORRIDORS.filter((c) => {
-    if (c.when_record_type !== null && !EXTRACTED_TYPES.includes(c.when_record_type)) return false;
-    // Every required field must be producible.
-    if ((c.when_has_fields ?? []).some((f) => !EXTRACTED_FIELDS.includes(f))) return false;
-    // And at least one carried field must exist, or nothing is emitted.
-    return c.carry_fields.some((f) => EXTRACTED_FIELDS.includes(f));
+  const unreachable = CORRIDORS.filter((c) => {
+    if (c.when_record_type !== null && !EXTRACTED_TYPES.includes(c.when_record_type)) return true;
+    if ((c.when_has_fields ?? []).some((f) => !EXTRACTED_FIELDS.includes(f))) return true;
+    return !c.carry_fields.some((f) => EXTRACTED_FIELDS.includes(f));
   }).map((c) => c.name);
 
   assertEquals(
-    reachable,
+    unreachable,
     [],
-    "a corridor just became reachable. Routing is now live for it - confirm the " +
-      "allowlist is right, and update the canary baselines, because derived " +
-      "records will change the per-role counts.",
+    "these corridors can never fire: either extraction cannot produce what they " +
+      "require, or nothing they carry exists. Dead configuration reads as coverage.",
+  );
+});
+
+Deno.test("attributes: every whitelisted key is named by some corridor", () => {
+  // The other direction. A key the extractor is told to look for, that no
+  // corridor reads, is prompt weight and storage bought for nothing - and
+  // the extractor is being asked to make a judgement no one uses.
+  const named = new Set<string>();
+  for (const c of CORRIDORS) {
+    for (const f of c.carry_fields) named.add(f);
+    for (const f of c.when_has_fields ?? []) named.add(f);
+  }
+  const orphans = ALLOWED_ATTRIBUTES.filter((k) => !named.has(k));
+  assertEquals(
+    orphans,
+    [],
+    "whitelisted attributes nothing routes on: drop them from the whitelist and " +
+      "the extraction prompt, or add the corridor that was meant to use them",
   );
 });
 

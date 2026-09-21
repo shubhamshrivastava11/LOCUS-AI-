@@ -19,6 +19,7 @@
 // No infinite loop - the cron interval is the poll loop.
 
 import { withAdmin, withTenant } from "../_shared/db.ts";
+import { sanitiseAttributes } from "../_shared/attributes.ts";
 import {
   type ClassificationRule,
   planRouting,
@@ -586,6 +587,21 @@ const TRIAGE_EXTRACTION_TOOL = {
         enum: [0, 1, 2, 3, null],
         description:
           "How sensitive the record is. 0=safe for anyone in the company. 1=ordinary work (DEFAULT - use this unless the text clearly says otherwise). 2=personnel, pay, unreleased commercial plans, security incidents. 3=legal exposure, acquisitions, named-individual performance. Null on DISCARD.",
+      },
+      attributes: {
+        type: "object",
+        description:
+          "Structured facts the text ACTUALLY states, as a flat object. Omit a key " +
+          "rather than guessing, and never infer one from context - a missing key is " +
+          "correct and useful, an invented one is worse than nothing because it routes " +
+          "this record to another team. Numbers as numbers, dates as YYYY-MM-DD. " +
+          "Recognised keys, all optional: role_title, band, start_date, annualised_cost, " +
+          "team, headcount_delta, effective_date, cost_centre, approved_amount, period, " +
+          "cost_driver, estimated_monthly_cost, constraint, applies_to, severity, " +
+          "affected_component, required_action, due_date, volume, account_segment, " +
+          "committed_date, reason_code, ship_date, user_facing, acceptance_criteria, " +
+          "metric, direction, measured_at. Anything else is discarded.",
+        additionalProperties: { type: ["string", "number", "boolean"] },
       },
       actors: {
         type: "array",
@@ -1492,6 +1508,7 @@ async function handleIngestionMessageInner(msg: PgmqMsg): Promise<string> {
     decision: string; confidence: number; reason_code: string;
     record_type: string | null; status: string | null; decision_statement: string | null;
     rationale: string | null; alternatives_considered: string[]; sensitivity: number | null;
+    attributes?: Record<string, unknown>;
     actors: { source_actor_id: string; role: string }[];
   };
 
@@ -1540,6 +1557,14 @@ async function handleIngestionMessageInner(msg: PgmqMsg): Promise<string> {
       result.sensitivity >= 0 && result.sensitivity <= 3
     ? result.sensitivity
     : 1;
+
+  // The model proposes keys; the server decides which survive. Anything not
+  // on the whitelist, and anything of the wrong shape, is dropped rather
+  // than coerced - a cost arriving as "about 145k" is not a number, and
+  // storing it either way would make a corridor that reads it silently
+  // wrong. Dropped means the corridor does not fire, which is correct for a
+  // fact we do not actually have.
+  const attributes = sanitiseAttributes(result.attributes);
 
   // Settings > Build Memory > "Core knowledge only" - real bug found live,
   // same as "Pause all learning": pure local React state before this, no
@@ -1661,12 +1686,12 @@ async function handleIngestionMessageInner(msg: PgmqMsg): Promise<string> {
       INSERT INTO public.decisions (
         tenant_id, record_type, decision_statement, rationale, alternatives_considered,
         status, scope, confidence, permission_scope, origin_raw_event_id,
-        classification, classified_by, classified_at
+        classification, classified_by, classified_at, attributes
       ) VALUES (
         ${tenantId}, ${extraction.record_type}, ${extraction.decision_statement}, ${extraction.rationale},
         ${extraction.alternatives_considered ?? []}, ${extraction.status}, 'team',
         ${extraction.confidence}, ${payload.permission_scope ?? []}, ${rawEventId},
-        ${classification}, ${classifiedBy}, now()
+        ${classification}, ${classifiedBy}, now(), ${sql.json(attributes)}
       ) RETURNING id
     `;
     const newDecisionId = decisionRows[0].id as string;
@@ -1727,6 +1752,10 @@ async function handleIngestionMessageInner(msg: PgmqMsg): Promise<string> {
           alternatives_considered: extraction.alternatives_considered,
           status: extraction.status,
           record_type: extraction.record_type,
+          // The structured facts are what corridors key on. Spread last so a
+          // whitelisted attribute cannot shadow one of the four prose fields
+          // above, which are the record itself rather than facts about it.
+          ...attributes,
         },
         // Records created here are always originals. A derived record is
         // written by emitRoutedRecords itself and never re-enters this path,

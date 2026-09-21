@@ -25,7 +25,11 @@
 // Requires a valid Supabase key in the Authorization header.
 
 import { withAdmin } from "../_shared/db.ts";
-import { CORRIDORS, DEPARTMENTS } from "../_shared/departmentTemplate.ts";
+import {
+  CLASSIFICATION_RULES,
+  CORRIDORS,
+  DEPARTMENTS,
+} from "../_shared/departmentTemplate.ts";
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
@@ -47,6 +51,8 @@ type Plan = {
   corridorsToCreate: string[];
   departmentsExisting: number;
   corridorsExisting: number;
+  rulesToCreate: string[];
+  rulesExisting: number;
   skippedCorridors: { name: string; why: string }[];
 };
 
@@ -86,6 +92,13 @@ Deno.serve(async (req) => {
           existingRules.map((r: Record<string, unknown>) => r.name as string),
         );
 
+        const existingClass = await sql`
+          SELECT name FROM public.classification_rules WHERE tenant_id = ${tenantId}::uuid
+        `;
+        const classNames = new Set(
+          existingClass.map((r: Record<string, unknown>) => r.name as string),
+        );
+
         const plan: Plan = {
           tenantId,
           tenantName: (t.name as string) ?? null,
@@ -93,6 +106,10 @@ Deno.serve(async (req) => {
           corridorsToCreate: CORRIDORS.filter((c) => !ruleNames.has(c.name)).map((c) => c.name),
           departmentsExisting: existingDepts.length,
           corridorsExisting: existingRules.length,
+          rulesToCreate: CLASSIFICATION_RULES.filter((r) => !classNames.has(r.name)).map((r) =>
+            r.name
+          ),
+          rulesExisting: existingClass.length,
           skippedCorridors: [],
         };
 
@@ -152,6 +169,31 @@ Deno.serve(async (req) => {
               ON CONFLICT DO NOTHING
             `;
           }
+
+          // Classification rules last: they reference a department by id
+          // too, and a tenant-wide rule has none, so both cases are handled
+          // here rather than in the corridor loop above.
+          for (const r of CLASSIFICATION_RULES) {
+            if (classNames.has(r.name)) continue;
+            const deptId = r.department === null ? null : keyToId.get(r.department) ?? null;
+            if (r.department !== null && deptId === null) {
+              plan.skippedCorridors.push({
+                name: r.name,
+                why: `missing department ${r.department}`,
+              });
+              continue;
+            }
+            await sql`
+              INSERT INTO public.classification_rules (
+                tenant_id, department_id, name, match_type, match_terms,
+                set_classification, set_compartment, priority
+              ) VALUES (
+                ${tenantId}::uuid, ${deptId}, ${r.name}, ${r.match_type}, ${r.match_terms},
+                ${r.set_classification}, ${r.set_compartment}, ${r.priority}
+              )
+              ON CONFLICT DO NOTHING
+            `;
+          }
         }
 
         out.push(plan);
@@ -164,8 +206,9 @@ Deno.serve(async (req) => {
       (acc, p) => ({
         departments: acc.departments + p.departmentsToCreate.length,
         corridors: acc.corridors + p.corridorsToCreate.length,
+        classificationRules: acc.classificationRules + p.rulesToCreate.length,
       }),
-      { departments: 0, corridors: 0 },
+      { departments: 0, corridors: 0, classificationRules: 0 },
     );
 
     return json({

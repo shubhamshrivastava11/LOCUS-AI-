@@ -206,9 +206,9 @@ export const CORRIDORS: CorridorTemplate[] = [
     name: "Accepted offer to Finance",
     from: "hr",
     to: "finance",
-    when_record_type: "offer_accepted",
+    when_record_type: "decision",
     when_min_classification: 3,
-    when_has_fields: [],
+    when_has_fields: ["annualised_cost", "role_title"],
     emit_classification: 2,
     carry_fields: ["role_title", "band", "start_date", "annualised_cost"],
     purpose: "headcount cost forecasting",
@@ -217,9 +217,9 @@ export const CORRIDORS: CorridorTemplate[] = [
     name: "Org change to affected managers",
     from: "hr",
     to: "executive",
-    when_record_type: "org_change",
+    when_record_type: "decision",
     when_min_classification: 2,
-    when_has_fields: [],
+    when_has_fields: ["team", "headcount_delta"],
     emit_classification: 2,
     carry_fields: ["team", "effective_date", "headcount_delta"],
     purpose: "org planning and reporting lines",
@@ -228,9 +228,9 @@ export const CORRIDORS: CorridorTemplate[] = [
     name: "Approved requisition to HR",
     from: "finance",
     to: "hr",
-    when_record_type: "budget_approval",
+    when_record_type: "decision",
     when_min_classification: 2,
-    when_has_fields: [],
+    when_has_fields: ["approved_amount", "role_title"],
     emit_classification: 2,
     carry_fields: ["role_title", "cost_centre", "approved_amount", "period"],
     purpose: "opening a requisition only once the budget for it exists",
@@ -239,9 +239,9 @@ export const CORRIDORS: CorridorTemplate[] = [
     name: "Approved budget to Engineering",
     from: "finance",
     to: "engineering",
-    when_record_type: "budget_approval",
+    when_record_type: "decision",
     when_min_classification: 2,
-    when_has_fields: [],
+    when_has_fields: ["approved_amount", "cost_centre"],
     emit_classification: 1,
     carry_fields: ["cost_centre", "approved_amount", "period", "decision_statement"],
     purpose: "letting a team plan against a budget it was granted",
@@ -421,6 +421,93 @@ export const CORRIDORS: CorridorTemplate[] = [
     emit_classification: 1,
     carry_fields: ["metric", "direction", "measured_at"],
     purpose: "strategy review against measured outcomes",
+  },
+];
+
+// ---------------------------------------------------------------------------
+// Classification rules
+// ---------------------------------------------------------------------------
+
+/** A classification rule before the departments have real uuids. */
+export type ClassificationRuleTemplate = {
+  name: string;
+  /** Department key, or null for tenant-wide. */
+  department: string | null;
+  match_type: "always" | "contains_any";
+  match_terms: string[];
+  set_classification: 0 | 1 | 2 | 3;
+  set_compartment: string | null;
+  priority: number;
+};
+
+/**
+ * The rules that raise a record above its department default.
+ *
+ * Kept few and specific. Every one of these can only RAISE, so the cost of a
+ * false positive is a record that is harder to reach than it needed to be,
+ * and the cost of a false negative is a record more visible than it should
+ * be. That asymmetry is why the terms are narrow words that rarely appear by
+ * accident rather than broad ones that catch everything.
+ *
+ * The HR compensation rule is the one the worked example turns on: it is
+ * what makes an accepted offer Confidential at source, so that the corridor
+ * to Finance is redacting something rather than forwarding an already-open
+ * record.
+ */
+export const CLASSIFICATION_RULES: ClassificationRuleTemplate[] = [
+  {
+    name: "Compensation is confidential",
+    department: "hr",
+    match_type: "contains_any",
+    // Deliberately not "pay" or "band" on their own: "pay attention" and
+    // "band 3 latency" are ordinary sentences, and a rule that fires on them
+    // buries real work behind a compartment nobody has.
+    match_terms: [
+      "salary", "compensation", "annualised cost", "annualized cost",
+      "equity grant", "bonus", "severance", "offer letter",
+    ],
+    set_classification: 3,
+    // At Confidential the compartment is the authority rather than the rank,
+    // so this names one. Without it the record would be unreadable by
+    // everyone including the person who wrote it.
+    set_compartment: "hiring",
+    priority: 10,
+  },
+  {
+    name: "Performance and conduct are confidential",
+    department: "hr",
+    match_type: "contains_any",
+    match_terms: [
+      "performance improvement", "disciplinary", "grievance",
+      "termination", "dismissal", "misconduct",
+    ],
+    set_classification: 3,
+    set_compartment: "people-cases",
+    priority: 10,
+  },
+  {
+    name: "Legal privilege is confidential",
+    department: "legal",
+    match_type: "contains_any",
+    match_terms: [
+      "privileged", "attorney-client", "litigation", "settlement",
+      "acquisition", "due diligence",
+    ],
+    set_classification: 3,
+    set_compartment: "legal-privileged",
+    priority: 10,
+  },
+  {
+    name: "Open security incidents are restricted",
+    department: "it_security",
+    match_type: "contains_any",
+    match_terms: [
+      "vulnerability", "breach", "exploit", "credential leak",
+      "unauthorised access", "unauthorized access",
+    ],
+    set_classification: 2,
+    set_compartment: null,
+    priority: 20,
   },
 ];
 
