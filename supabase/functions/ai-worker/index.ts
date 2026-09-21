@@ -1144,6 +1144,8 @@ async function emitRoutedRecords(
     departmentId: string;
     fields: Record<string, unknown>;
     isDerived: boolean;
+    /** Mirrored onto the derived record. See the insert below. */
+    status: string;
   },
   _sourceScopes: string[],
 ): Promise<RoutingAuditRow[]> {
@@ -1191,6 +1193,18 @@ async function emitRoutedRecords(
       continue;
     }
 
+    // The carried fields that are not columns belong in attributes, or the
+    // destination gets a headline and no data. The audit row recorded that
+    // four fields crossed while the record itself stored none of them - true
+    // of the crossing, useless to Finance.
+    const PROSE_COLUMNS = new Set([
+      "decision_statement", "rationale", "alternatives_considered", "record_type", "status",
+    ]);
+    const derivedAttributes: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(plan.fields)) {
+      if (!PROSE_COLUMNS.has(k)) derivedAttributes[k] = v;
+    }
+
     const statement = typeof plan.fields.decision_statement === "string"
       ? plan.fields.decision_statement
       : `${record.record_type} routed from ${nameById.get(plan.rule.id)?.from ?? "another department"}`;
@@ -1199,15 +1213,16 @@ async function emitRoutedRecords(
       INSERT INTO public.decisions (
         tenant_id, record_type, decision_statement, rationale,
         alternatives_considered, status, scope, confidence, permission_scope,
-        classification, classified_by, classified_at,
+        classification, classified_by, classified_at, attributes,
         source_decision_id, routed_purpose, routed_by_rule
       ) VALUES (
         ${tenantId}, ${record.record_type}, ${statement},
         ${typeof plan.fields.rationale === "string" ? plan.fields.rationale : null},
         ${Array.isArray(plan.fields.alternatives_considered) ? plan.fields.alternatives_considered : []},
-        ${typeof plan.fields.status === "string" ? plan.fields.status : "open"},
+        ${record.status},
         'team', 1.0, ${scopes},
         ${plan.classification}, 'routing_rule', now(),
+        ${sql.json(derivedAttributes as any)}::jsonb,
         ${plan.sourceDecisionId}, ${plan.purpose}, ${plan.rule.id}
       ) RETURNING id
     `;
@@ -1666,7 +1681,18 @@ async function handleIngestionMessageInner(msg: PgmqMsg): Promise<string> {
     const outcome = resolveClassification(
       ruleRows as unknown as ClassificationRule[],
       {
+        // The SOURCE text as well as the extraction, and the source is the
+        // load-bearing half.
+        //
+        // Matching the extraction alone missed a real case on the first live
+        // run: a message saying "do not share the salary discussion" was
+        // summarised to "Approved offer for Senior Engineer role at band 3",
+        // and the compensation rule never saw the word that made the record
+        // sensitive. The summariser is allowed to drop words; a rule reading
+        // only its output inherits every omission, and each omission lands
+        // on the side of too visible.
         text: [
+          userMsg,
           extraction.decision_statement,
           extraction.rationale ?? "",
           ...(extraction.alternatives_considered ?? []),
@@ -1691,7 +1717,7 @@ async function handleIngestionMessageInner(msg: PgmqMsg): Promise<string> {
         ${tenantId}, ${extraction.record_type}, ${extraction.decision_statement}, ${extraction.rationale},
         ${extraction.alternatives_considered ?? []}, ${extraction.status}, 'team',
         ${extraction.confidence}, ${payload.permission_scope ?? []}, ${rawEventId},
-        ${classification}, ${classifiedBy}, now(), ${sql.json(attributes)}
+        ${classification}, ${classifiedBy}, now(), ${sql.json(attributes as any)}::jsonb
       ) RETURNING id
     `;
     const newDecisionId = decisionRows[0].id as string;
@@ -1750,13 +1776,15 @@ async function handleIngestionMessageInner(msg: PgmqMsg): Promise<string> {
           decision_statement: extraction.decision_statement,
           rationale: extraction.rationale,
           alternatives_considered: extraction.alternatives_considered,
-          status: extraction.status,
           record_type: extraction.record_type,
           // The structured facts are what corridors key on. Spread last so a
           // whitelisted attribute cannot shadow one of the four prose fields
           // above, which are the record itself rather than facts about it.
           ...attributes,
         },
+        // Mirrors the source: a derived record is not more or less settled
+        // than the decision it came from.
+        status: extraction.status ?? "decided",
         // Records created here are always originals. A derived record is
         // written by emitRoutedRecords itself and never re-enters this path,
         // which is what keeps routing to a single hop.
