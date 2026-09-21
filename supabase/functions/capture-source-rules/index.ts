@@ -256,7 +256,7 @@ Deno.serve(async (req: Request) => {
    *
    * Was written as `callerRole === "member"`, which was an exhaustive test
    * back when the only roles were owner, admin and member. It stopped being
-   * one the moment Lead and Guest existed - a Guest is not "member", so the
+   * one the moment Lead and External existed - an External member is not "member", so the
    * old form would have handed a contractor the right to disconnect the
    * team's Slack.
    *

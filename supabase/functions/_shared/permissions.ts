@@ -47,7 +47,7 @@ export function clearanceForLevel(roleLevel: number): number {
   if (roleLevel >= 4) return 3; // Owner, Admin
   if (roleLevel === 3) return 2; // Lead
   if (roleLevel === 2) return 1; // Member
-  return 0; // Guest, and anything unrecognised
+  return 0; // External, and anything unrecognised
 }
 
 export const CLASSIFICATION_NAMES = ["Public", "Internal", "Restricted", "Confidential"];
@@ -55,7 +55,7 @@ export const CLASSIFICATION_NAMES = ["Public", "Internal", "Restricted", "Confid
 /** Confidential. Clearance alone is never enough for this level. */
 export const CONFIDENTIAL = 3;
 
-/** Member. A Guest is never admitted to Confidential, grant or not. */
+/** Member. An External member is never admitted to Confidential, grant or not. */
 const MIN_LEVEL_FOR_CONFIDENTIAL = 2;
 
 // ── Scope membership ─────────────────────────────────────────────────────
@@ -231,7 +231,7 @@ export async function loadCallerAuthz(
     );
   }
 
-  // An expired Guest IS an expected path, and unlike the case above it degrades
+  // An expired External member IS an expected path, and unlike the case above it degrades
   // rather than throws: their membership is real, it has simply run out, and
   // "sees nothing above Public" is the defined behaviour rather than a fault.
   const expired = row.expires_at ? new Date(row.expires_at).getTime() <= Date.now() : false;
@@ -316,7 +316,7 @@ export function scopeAllows(
  * Every other cell of the document's table is unchanged by this reading,
  * because the roles it shows as refused hold no grant.
  *
- * Guests are the one hard floor. "Read-only, public records in explicitly
+ * External members are the one hard floor. "Read-only, public records in explicitly
  * granted scopes, time-limited" is the entire role; admitting a contractor to
  * acquisition discussions because somebody clicked the wrong row is not a
  * mistake worth leaving available.

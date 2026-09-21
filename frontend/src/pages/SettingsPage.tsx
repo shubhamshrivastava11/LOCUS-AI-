@@ -538,11 +538,11 @@ function connectionLabel(row: SourceConnectionRow): string | null {
  *
  * Checks here used to read `role !== 'member'`, which was an exhaustive test
  * of "is this person privileged" when member was the only unprivileged role.
- * With Guest added it silently stopped being one - a contractor is not
+ * With External added it silently stopped being one - a contractor is not
  * 'member', so they would have been shown the whole management surface. Level
  * comparisons do not rot that way when a role is added.
  */
-const ROLE_LEVELS: Record<string, number> = { owner: 5, admin: 4, lead: 3, member: 2, guest: 1 }
+const ROLE_LEVELS: Record<string, number> = { owner: 5, admin: 4, lead: 3, member: 2, external: 1 }
 const LEVEL_MEMBER = 2
 
 function levelOf(member: TeamMember | undefined): number {
@@ -591,7 +591,7 @@ function TeamSettings() {
 
   const [isInviteOpen, setIsInviteOpen] = useState(false)
   const [inviteEmail, setInviteEmail] = useState('')
-  const [inviteRole, setInviteRole] = useState<'guest' | 'member' | 'lead' | 'admin'>('member')
+  const [inviteRole, setInviteRole] = useState<'external' | 'member' | 'lead' | 'admin'>('member')
   const [isInviting, setIsInviting] = useState(false)
   const [inviteError, setInviteError] = useState('')
   const [inviteResult, setInviteResult] = useState<{ url: string; emailSent: boolean } | null>(null)
@@ -740,7 +740,7 @@ function TeamSettings() {
    *
    * Optimistic, then reconciled from the server, because the server applies
    * rules the list cannot see on its own - the last owner cannot be demoted,
-   * a promotion out of guest has to clear the expiry - and the honest outcome
+   * a promotion out of external has to clear the expiry - and the honest outcome
    * is whatever comes back from it rather than what was clicked.
    */
   const handleRoleChange = async (member: TeamMember, nextRole: string) => {
@@ -892,7 +892,7 @@ function TeamSettings() {
                 <span className="rounded-full bg-[#F3F4F6] px-2.5 py-1 text-[12px] font-medium capitalize text-[#4B5563]">
                   {member.role}
                 </span>
-                {/* A guest past their window keeps their row but sees nothing
+                {/* A external past their window keeps their row but sees nothing
                     above Public, so the list has to say so rather than showing
                     them as an ordinary member. */}
                 {member.expired ? (
@@ -919,7 +919,7 @@ function TeamSettings() {
                     {/* Only what this caller may actually assign. Offering a
                         level the server will refuse turns a rule into an
                         error message. */}
-                    {(['guest', 'member', 'lead', 'admin', 'owner'] as const)
+                    {(['external', 'member', 'lead', 'admin', 'owner'] as const)
                       .filter((r) =>
                         r === member.role ||
                         (r === 'owner'
@@ -1065,20 +1065,20 @@ function TeamSettings() {
                   <select
                     value={inviteRole}
                     onChange={(event) =>
-                      setInviteRole(event.target.value as 'guest' | 'member' | 'lead' | 'admin')}
+                      setInviteRole(event.target.value as 'external' | 'member' | 'lead' | 'admin')}
                     className="mt-1.5 w-full rounded-lg border border-[#DEE1E8] px-3 py-2 text-[14px] text-[#111827] outline-none focus:border-[#5A45FF]"
                   >
                     {/* Ordered least to most, so the safe choice reads first
                         and Admin is a deliberate scroll rather than the
                         neighbour of the default. Owner is absent on purpose:
                         ownership is transferred, never sent in a link. */}
-                    <option value="guest">Guest &middot; read-only, expires</option>
+                    <option value="external">External &middot; read-only, expires</option>
                     <option value="member">Member &middot; search and read</option>
                     <option value="lead">Lead &middot; owns scopes, team digest</option>
                     <option value="admin">Admin &middot; members and connectors</option>
                   </select>
                   <p className="mt-1.5 text-[12px] leading-4 text-[#9CA3AF]">
-                    {inviteRole === 'guest'
+                    {inviteRole === 'external'
                       ? 'Sees only public records in the scopes you grant, and loses access after 30 days.'
                       : inviteRole === 'member'
                       ? 'Sees ordinary records in the channels and pages they belong to.'

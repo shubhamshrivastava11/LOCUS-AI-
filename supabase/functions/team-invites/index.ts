@@ -113,18 +113,18 @@ const ROLE_LEVELS: Record<string, number> = {
   admin: 4,
   lead: 3,
   member: 2,
-  guest: 1,
+  external: 1,
 };
 
 /** Roles that can be handed out by invitation. Owner is transferred, not invited. */
-const INVITABLE_ROLES = ["admin", "lead", "member", "guest"];
+const INVITABLE_ROLES = ["admin", "lead", "member", "external"];
 
 function levelOf(role: string | null | undefined): number {
   return ROLE_LEVELS[String(role ?? "")] ?? 0;
 }
 
-/** Default Guest window when an inviter does not name one. */
-const GUEST_DEFAULT_DAYS = 30;
+/** Default External window when an inviter does not name one. */
+const EXTERNAL_DEFAULT_DAYS = 30;
 
 /**
  * Who may hand out, or take away, a given role.
@@ -261,18 +261,18 @@ Deno.serve(async (req: Request) => {
         return jsonResponse({ error: `You can't invite someone as ${role}` }, 403);
       }
 
-      // Guests are time-limited by definition - that is what separates a Guest
-      // from a Member with a narrow scope list. An inviter who names no window
+      // An External seat is time-limited by definition - that is what
+      // separates it from a Member with a narrow scope list. An inviter who names no window
       // gets the default rather than a membership that never ends, because a
       // contractor whose access quietly outlives the contract is the exact
       // failure the role exists to prevent.
       let membershipExpiresAt: string | null = null;
-      if (role === "guest") {
+      if (role === "external") {
         const requested = body.expires_at ? new Date(String(body.expires_at)) : null;
         const valid = requested && !Number.isNaN(requested.getTime()) && requested.getTime() > Date.now();
         membershipExpiresAt = (valid
           ? requested
-          : new Date(Date.now() + GUEST_DEFAULT_DAYS * 86_400_000)).toISOString();
+          : new Date(Date.now() + EXTERNAL_DEFAULT_DAYS * 86_400_000)).toISOString();
       }
 
       const { data: tenant } = await supabase.from("tenants").select("name, plan").eq("id", caller.tenantId).maybeSingle();
@@ -335,9 +335,9 @@ Deno.serve(async (req: Request) => {
 
       const { error: membershipError } = await supabase.from("memberships").insert({
         tenant_id: invite.tenant_id, user_id: authed.user.id, role: invite.role,
-        // Only ever set for a Guest - a CHECK on memberships enforces that,
+        // Only ever set for an External member - a CHECK on memberships enforces that,
         // so sending it for any other role would be rejected outright.
-        expires_at: invite.role === "guest" ? invite.membership_expires_at : null,
+        expires_at: invite.role === "external" ? invite.membership_expires_at : null,
       });
       if (membershipError) {
         console.error("Unable to create membership:", membershipError);
@@ -444,7 +444,7 @@ Deno.serve(async (req: Request) => {
           can_manage_connectors: m.can_manage_connectors === true,
           can_view_audit: m.can_view_audit === true,
           expires_at: m.expires_at,
-          // A Guest past their window still has a row; it is the access rule
+          // An External member past their window still has a row; it is the access rule
           // that drops them to Public-only. Surfaced so the list says
           // "expired" rather than showing them as an ordinary member.
           expired: m.expires_at ? new Date(m.expires_at).getTime() <= Date.now() : false,
@@ -539,15 +539,15 @@ Deno.serve(async (req: Request) => {
           return jsonResponse({ error: `You can't make someone ${nextRole}` }, 403);
         }
         update.role = nextRole;
-        // The CHECK on memberships allows expires_at only for a Guest, so
-        // promoting out of Guest has to clear it in the same statement or the
-        // update is rejected. Demoting TO Guest without a window would leave a
-        // guest who never expires, which the role is specifically meant to
+        // The CHECK on memberships allows expires_at only for an External member, so
+        // promoting out of External has to clear it in the same statement or the
+        // update is rejected. Demoting TO External without a window would leave a
+        // external who never expires, which the role is specifically meant to
         // prevent, so it gets the default.
-        if (nextRole !== "guest") {
+        if (nextRole !== "external") {
           update.expires_at = null;
         } else if (body.expires_at === undefined) {
-          update.expires_at = new Date(Date.now() + GUEST_DEFAULT_DAYS * 86_400_000).toISOString();
+          update.expires_at = new Date(Date.now() + EXTERNAL_DEFAULT_DAYS * 86_400_000).toISOString();
         }
       }
 
@@ -564,8 +564,8 @@ Deno.serve(async (req: Request) => {
 
       if (body.expires_at !== undefined) {
         const role = String(update.role ?? target.role);
-        if (role !== "guest") {
-          return jsonResponse({ error: "Only guests have an expiry date" }, 422);
+        if (role !== "external") {
+          return jsonResponse({ error: "Only external members have an expiry date" }, 422);
         }
         const when = new Date(String(body.expires_at));
         if (Number.isNaN(when.getTime())) return jsonResponse({ error: "Invalid expiry date" }, 422);

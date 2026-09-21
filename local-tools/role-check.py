@@ -33,7 +33,7 @@ EXPECTED = {
     "cy.lead@aggregate-test.invalid":     ("Lead",   3, 30),
     "dia.member@aggregate-test.invalid":  ("Member", 2, 28),
     "elis.member@aggregate-test.invalid": ("Member", 2, 25),
-    "fen.guest@aggregate-test.invalid":   ("Guest",  1, 2),
+    "fen.guest@aggregate-test.invalid":   ("External",  1, 2),
 }
 
 

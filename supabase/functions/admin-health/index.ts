@@ -266,7 +266,7 @@ async function permissionCanary(): Promise<
         `${b.label}: clearance ${authz.clearance} does not match role level ${authz.roleLevel}`,
       );
     }
-    // Clearance 0 on anything above a Guest is the exact signature of the
+    // Clearance 0 on anything above an External member is the exact signature of the
     // 16 Sep outage, and it is worth naming rather than leaving as a count
     // mismatch, because the cause is always the same: the membership read
     // returned nothing.

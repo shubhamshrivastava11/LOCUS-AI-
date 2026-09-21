@@ -141,9 +141,9 @@ Deno.test("clearance: at Confidential the compartment outranks the rank", () => 
   assertEquals(clearanceAllows(record, memberGranted), true);
 });
 
-Deno.test("clearance: a Guest is never admitted to Confidential, grant or not", () => {
-  const guestGranted = caller(1, { confidential: [HR] });
-  assertEquals(clearanceAllows({ classification: 3, permission_scope: [HR] }, guestGranted), false);
+Deno.test("clearance: an External member is never admitted to Confidential, grant or not", () => {
+  const externalGranted = caller(1, { confidential: [HR] });
+  assertEquals(clearanceAllows({ classification: 3, permission_scope: [HR] }, externalGranted), false);
 });
 
 Deno.test("clearance: Confidential needs a grant even at Admin", () => {
@@ -168,7 +168,7 @@ Deno.test("clearance: a Confidential record with no scope can never be granted",
 Deno.test("clearance: a missing classification is treated as Internal", () => {
   assertEquals(clearanceAllows({}, caller(2)), true);
   assertEquals(clearanceAllows({ classification: null }, caller(2)), true);
-  assertEquals(clearanceAllows({}, caller(1)), false); // Guest reads Public only
+  assertEquals(clearanceAllows({}, caller(1)), false); // External reads Public only
 });
 
 // ── The table from the design document ───────────────────────────────────
@@ -193,7 +193,7 @@ Deno.test("R1 routine, Internal, #eng", () => {
   assertEquals(isRecordVisible(r1, [], caller(4, { memberOf: [ENG], known: [ENG] })), true);
   assertEquals(isRecordVisible(r1, [], caller(3, { memberOf: [ENG], known: [ENG] })), true);
   assertEquals(isRecordVisible(r1, [], caller(2, { memberOf: [ENG], known: [ENG] })), true);
-  // A Guest is in the scope and still refused: clearance 0, record is Internal.
+  // An External member is in the scope and still refused: clearance 0, record is Internal.
   assertEquals(isRecordVisible(r1, [], caller(1, { memberOf: [ENG], known: [ENG] })), false);
 });
 
@@ -221,11 +221,11 @@ Deno.test("R3 performance review, Confidential, #hr-private", () => {
   assertEquals(isRecordVisible(r3, [], caller(2, { memberOf: [HR], known: [HR] })), false);
 });
 
-Deno.test("an expired Guest reads nothing above Public", () => {
+Deno.test("an expired External member reads nothing above Public", () => {
   const record = { permission_scope: [ENG], classification: 1 };
-  const guest = caller(1, { memberOf: [ENG], known: [ENG], expired: true });
-  assertEquals(guest.clearance, 0);
-  assertEquals(isRecordVisible(record, [], guest), false);
+  const external = caller(1, { memberOf: [ENG], known: [ENG], expired: true });
+  assertEquals(external.clearance, 0);
+  assertEquals(isRecordVisible(record, [], external), false);
 });
 
 Deno.test("floorAuthz strips clearance and grants but not scope", () => {
