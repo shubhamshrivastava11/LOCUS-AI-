@@ -101,12 +101,35 @@ export const EMPTY_SCOPE_ACCESS: ScopeAccess = { known: new Set(), memberOf: new
 export async function loadScopeAccess(
   tenantId: string,
   email: string | null,
+  userId?: string | null,
 ): Promise<ScopeAccess> {
   try {
     const rows = await withTenant(tenantId, async (sql) => {
+      // Match the PERSON, not one address.
+      //
+      // member_email comes from the connected source, and a person's Slack
+      // address is routinely not the address they signed up with. Lam's
+      // Locus account is lam.dao@cstu.edu and his Slack account is
+      // dnlamvhit@gmail.com; matching on the login address alone made him a
+      // member of nothing, and because his channels ARE synced they count
+      // as known, which fails closed. He saw 0 of his 7 records and the
+      // product looked like it had lost them.
+      //
+      // user_identities holds the other addresses. The subquery is scoped
+      // to this user so one person's aliases can never widen another's
+      // access, and a unique index makes an address belong to at most one
+      // person per tenant.
       return await sql`
         select external_scope_id,
-               bool_or(lower(member_email) = lower(${email ?? ""})) as is_member
+               bool_or(
+                 lower(member_email) = lower(${email ?? ""})
+                 or lower(member_email) in (
+                   select lower(ui.email)
+                   from public.user_identities ui
+                   where ui.tenant_id = ${tenantId}::uuid
+                     and ui.user_id = ${userId ?? null}::uuid
+                 )
+               ) as is_member
         from public.source_scope_members
         where tenant_id = ${tenantId}::uuid
         group by external_scope_id
@@ -199,7 +222,7 @@ export async function loadCallerAuthz(
         where tenant_id = ${tenantId}::uuid and user_id = ${userId}::uuid
       `;
     }),
-    loadScopeAccess(tenantId, email),
+    loadScopeAccess(tenantId, email, userId),
   ]);
 
   // No membership row means the caller is not in this tenant at all, and every

@@ -1274,6 +1274,7 @@ async function handleIngestionMessageInner(msg: PgmqMsg): Promise<string> {
     thread_ref?: string | null; permission_scope: string[]; raw_content: unknown;
     source_permalink?: string | null; received_at: string; actor_display_name?: string;
     connection_id?: string; likely_bulk_mail?: boolean;
+    filter_signals?: Record<string, unknown>;
     known_actors?: { name: string; source_actor_id: string }[];
     capture_item_id?: string | string[];
   };
@@ -1490,8 +1491,19 @@ async function handleIngestionMessageInner(msg: PgmqMsg): Promise<string> {
   // $0, not a discount. This is what should have caught the "Charger Bands
   // Newsletter" false-positive decision before it ever reached the model.
   if (payload.likely_bulk_mail) {
+    // Write down the decision and the signals behind it. Previously this
+    // marked the event done and moved on, which made the drop invisible:
+    // nothing on the row said it had been skipped, let alone why, so a
+    // connector discarding 98% of its input looked identical to a
+    // connector whose input genuinely held nothing.
     await withTenant(tenantId, async (sql) => {
-      await sql`UPDATE public.raw_events SET pipeline_status = 'done' WHERE id = ${rawEventId}`;
+      await sql`
+        UPDATE public.raw_events
+        SET pipeline_status = 'done',
+            skip_reason = 'bulk_mail',
+            filter_signals = ${sql.json((payload.filter_signals ?? {}) as any)}::jsonb
+        WHERE id = ${rawEventId}
+      `;
     });
     await pgmqDelete("ingestion", msg.msg_id);
     return "prefiltered_bulk_mail";
@@ -1506,7 +1518,11 @@ async function handleIngestionMessageInner(msg: PgmqMsg): Promise<string> {
   // system prompt, not the per-event call itself.
   if (isTriviallyDiscardable(payload.raw_content, payload.source)) {
     await withTenant(tenantId, async (sql) => {
-      await sql`UPDATE public.raw_events SET pipeline_status = 'done' WHERE id = ${rawEventId}`;
+      await sql`
+        UPDATE public.raw_events
+        SET pipeline_status = 'done', skip_reason = 'trivial_ack'
+        WHERE id = ${rawEventId}
+      `;
     });
     await pgmqDelete("ingestion", msg.msg_id);
     return "prefiltered_trivial_ack";

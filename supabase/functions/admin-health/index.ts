@@ -20,7 +20,8 @@
 
 import { withAdmin, withTenant } from "../_shared/db.ts";
 import { requireInternalKey } from "../_shared/internalAuth.ts";
-import { clearanceForLevel, filterVisibleRecords, loadCallerAuthz } from "../_shared/permissions.ts";
+import { clearanceForLevel, filterVisibleRecords, isRecordVisible, loadCallerAuthz,
+} from "../_shared/permissions.ts";
 import { resolvePermissionScopes } from "../_shared/tenantAuth.ts";
 
 const RESEND_API_KEY = Deno.env.get("RESEND_API_KEY") ?? "";
@@ -320,21 +321,38 @@ async function everyOwnerSeesSomething(): Promise<
     ) as unknown as { user_id: string }[];
     if (owner.length === 0) continue;
 
-    const { email } = await resolvePermissionScopes(owner[0].user_id, t.id);
+    const { email, scopes: callerScopes } = await resolvePermissionScopes(owner[0].user_id, t.id);
     const authz = await loadCallerAuthz(t.id, owner[0].user_id, email);
 
-    // Clearance alone, which is the dimension that failed. Scope is left out
-    // deliberately: a tenant whose owner genuinely belongs to no channel is a
-    // legitimate state, and folding it in here would make this noisy.
-    const rows = await withTenant(t.id, async (sql) =>
+    // The FULL rule now, scope included.
+    //
+    // This previously tested clearance alone, on the reasoning that a
+    // tenant whose owner belongs to no channel is a legitimate state and
+    // folding scope in would make the check noisy. Defensible, and wrong in
+    // effect: it went green for days while Lam saw 0 of his 7 records,
+    // because his clearance was 3 and every record passed
+    // `classification <= 3`. The dimension that broke was the one not
+    // being looked at.
+    //
+    // The distinction the old version missed: an owner belonging to no
+    // channel may be legitimate, an owner seeing NOTHING in a tenant that
+    // has records never is. So the predicate widens to the real one and the
+    // alarm condition stays exactly "sees zero", which is what makes it
+    // quiet rather than noisy.
+    const records = await withTenant(t.id, async (sql) =>
       await sql`
-        select count(*)::int as n from public.decisions
+        select classification, permission_scope from public.decisions
         where tenant_id = ${t.id}::uuid and superseded_by is null
-          and classification <= ${authz.clearance}
       `
-    ) as unknown as { n: number }[];
+    ) as unknown as { classification: number; permission_scope: string[] }[];
 
-    const n = Number(rows[0]?.n ?? 0);
+    const n = records.filter((r) =>
+      isRecordVisible(
+        { classification: r.classification, permission_scope: r.permission_scope },
+        callerScopes ?? [],
+        authz,
+      )
+    ).length;
     seen.push({ tenant: t.name, records: t.records, owner_clearance: authz.clearance, passes: n });
     if (n === 0) blind.push(`${t.name}: ${t.records} records, top member can read 0`);
   }

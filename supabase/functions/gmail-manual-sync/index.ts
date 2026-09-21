@@ -408,6 +408,36 @@ Deno.serve(async (_req) => {
         // discarded anyway - this is what the Charger Bands newsletter
         // false-positive decision should have hit before it ever reached
         // the model.
+        // The signals, recorded individually rather than collapsed into one
+        // boolean. The open question is not "is this bulk" but "which
+        // COMBINATION should drop": List-Unsubscribe alone is what we use
+        // today, and the suspicion is that it needs corroboration, because
+        // applicant tracking systems set it on genuine, threaded,
+        // person-to-person mail.
+        //
+        // Recording them changes no behaviour. likelyBulkMail below is
+        // computed exactly as before, so the filter drops precisely what it
+        // dropped yesterday - these are only written down so a narrower
+        // rule can be evaluated against real traffic before it ships.
+        const fromRaw = String(fromHeader ?? "");
+        const filterSignals = {
+          list_unsubscribe: Boolean(getHeader("List-Unsubscribe")),
+          precedence: getHeader("Precedence") || null,
+          auto_submitted: getHeader("Auto-Submitted") || null,
+          // A no-reply sender is the strongest single marketing tell, but on
+          // its own it also matches transactional mail people very much want.
+          noreply_sender: /no[-_.]?reply|donotreply|do-not-reply/i.test(fromRaw),
+          // Threaded mail is conversation. A newsletter almost never is, and
+          // an ATS reply usually is.
+          in_thread: Boolean(getHeader("In-Reply-To") || getHeader("References")),
+          // Gmail's own classification, which is the judgement of a system
+          // with far more signal than we have.
+          promotions: Array.isArray(rawMsg.labelIds) &&
+            (rawMsg.labelIds as string[]).includes("CATEGORY_PROMOTIONS"),
+          updates: Array.isArray(rawMsg.labelIds) &&
+            (rawMsg.labelIds as string[]).includes("CATEGORY_UPDATES"),
+        };
+
         const likelyBulkMail = Boolean(getHeader("List-Unsubscribe"));
 
         const envelope: IngestionEnvelope = {
@@ -426,6 +456,7 @@ Deno.serve(async (_req) => {
             ? (rawMsg.labelIds as string[])
             : undefined,
           likely_bulk_mail: likelyBulkMail,
+          filter_signals: filterSignals,
           raw_content: {
             subject: getHeader("Subject"),
             body,

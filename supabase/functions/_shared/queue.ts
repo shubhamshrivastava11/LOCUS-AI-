@@ -43,6 +43,8 @@ export interface IngestionEnvelope {
   // (e.g. Gmail's List-Unsubscribe header) before any AI call. ai-worker
   // skips triage+extraction entirely for these - $0 cost, not a discount.
   likely_bulk_mail?: boolean;
+  /** Per-signal detail behind likely_bulk_mail, for measuring the filter. */
+  filter_signals?: Record<string, unknown>;
   // Real, structured identities the connector already knows for this
   // event (an issue's creator + comment authors, a page's editors) -
   // distinct from `actor`/`actor_display_name`, which name only the ONE
