@@ -585,3 +585,9 @@ verify_jwt = false
 
 [functions.teams-webhook]
 verify_jwt = false
+
+# Replays already-ingested events through the pipeline. verify_jwt, same
+# reasoning as admin-seed-departments: this one can spend money, so it must
+# not be reachable with only a shared secret.
+[functions.admin-replay]
+verify_jwt = true

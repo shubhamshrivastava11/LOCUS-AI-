@@ -25,6 +25,7 @@
 // frontend-initiated call) is ported.
 
 import { withAdmin, withTenant } from "../_shared/db.ts";
+import { byteaToUint8Array, decryptRawContent } from "../_shared/rawContentCrypto.ts";
 import { cleanDisplayText } from "../_shared/htmlText.ts";
 import { decryptToken } from "../_shared/tokenCrypto.ts";
 import { enforceUserPromptLimit, PromptLimitExceededError } from "../_shared/userLimits.ts";
@@ -118,28 +119,10 @@ async function fetchWithTimeout(url: string, init: RequestInit, timeoutMs: numbe
   }
 }
 
-// ── Decryption (reverse of ai-worker/index.ts's encryptRawContent, same
-// AES-256-GCM / "LOCUS1" blob format) - needed to reconstruct the actual
-// conversation thread behind a decision from the encrypted raw_events it
-// came from, not just the single triggering message. ──────────────────────
-
-const LOCUS_MAGIC = new TextEncoder().encode("LOCUS1");
-const NONCE_LEN = 12;
-
-async function getAesKey(): Promise<CryptoKey> {
-  const secret = Deno.env.get("RAW_EVENTS_ENCRYPTION_KEY") || Deno.env.get("APP_SECRET_KEY");
-  if (!secret) throw new Error("RAW_EVENTS_ENCRYPTION_KEY or APP_SECRET_KEY is not set");
-  const hash = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(secret));
-  return crypto.subtle.importKey("raw", hash, "AES-GCM", false, ["decrypt"]);
-}
-
-async function decryptRawContent(encrypted: Uint8Array): Promise<string> {
-  const key = await getAesKey();
-  const nonce = encrypted.slice(LOCUS_MAGIC.length, LOCUS_MAGIC.length + NONCE_LEN);
-  const ciphertext = encrypted.slice(LOCUS_MAGIC.length + NONCE_LEN);
-  const plaintext = await crypto.subtle.decrypt({ name: "AES-GCM", iv: nonce }, key, ciphertext);
-  return new TextDecoder().decode(plaintext);
-}
+// Decryption of raw_events.raw_content now lives in
+// _shared/rawContentCrypto.ts, because admin-replay needs the same routine
+// and two copies of a decrypt path drift silently, then fail on old rows
+// only, long after anyone remembers there were two.
 
 // notion-poller stores raw_content as the entire raw Notion API page object
 // (properties, ids, timestamps, everything), not flat text - reads a
@@ -259,17 +242,6 @@ function resolveDiscordMentions(text: string, actorNameByRawId: Map<string, stri
 // wire - normally a Uint8Array/Buffer, but a hex-encoded "\x4c4f..." string
 // (Postgres's default bytea_output) is also possible depending on the
 // driver path taken. Handle both rather than assuming one.
-function byteaToUint8Array(value: unknown): Uint8Array {
-  if (value instanceof Uint8Array) return value;
-  if (typeof value === "string") {
-    const hex = value.startsWith("\\x") ? value.slice(2) : value;
-    const bytes = new Uint8Array(hex.length / 2);
-    for (let i = 0; i < bytes.length; i++) bytes[i] = parseInt(hex.substr(i * 2, 2), 16);
-    return bytes;
-  }
-  return new Uint8Array(value as ArrayLike<number>);
-}
-
 // The actors table only ever has a row for people extracted as an actual
 // decision participant (role decided_by/mentioned) - someone who just
 // chatted in the reconstructed thread without ever being named in a
