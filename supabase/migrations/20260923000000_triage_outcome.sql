@@ -18,13 +18,20 @@
 alter table public.raw_events
   add column if not exists triage_reason text;
 
--- 'pending' until the worker reports back, then the model's own verdict.
--- Deliberately not a CHECK constraint: the set of verdicts is the model's
--- contract rather than the schema's, and a new one appearing should show up
--- in a query, not stall the pipeline the way the classified_by constraint
--- nearly did.
+-- triage_result already carries a CHECK constraint from an earlier migration
+-- allowing exactly pending/kept/uncertain/discarded. The first version of
+-- this change wrote keep/discard/uncertain_held instead - near-miss synonyms
+-- - and every write was rejected, dead-lettering 25 events. Latent all day
+-- behind the spend cap, then immediate once the cap was raised. So: use the
+-- vocabulary the schema already has rather than inventing a second spelling
+-- of it, and read the constraint before writing the column. That is now
+-- twice on this pipeline that a CHECK has stalled ingestion.
+--
+-- triage_reason takes no constraint, deliberately: reason codes are the
+-- model's contract rather than the schema's, and a new one appearing should
+-- show up in a query, not stall the queue.
 comment on column public.raw_events.triage_result is
-  'The model verdict: pending, keep, discard, or uncertain_held. Written by '
+  'The model verdict: pending, kept, uncertain, or discarded. Written by '
   'ai-worker after the triage call, not at insert.';
 comment on column public.raw_events.triage_reason is
   'The model reason_code behind that verdict, so low-yield sources can be '

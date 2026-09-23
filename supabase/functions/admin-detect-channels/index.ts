@@ -38,7 +38,7 @@ const VOYAGE_MODEL = Deno.env.get("VOYAGE_EMBED_MODEL") ?? "voyage-4-large";
 const MODEL = "claude-haiku-4-5-20251001";
 
 /** Same ceiling ai-worker enforces, and the same table behind it. */
-const DAILY_SPEND_CAP_USD = Number(Deno.env.get("AI_DAILY_SPEND_CAP_USD") ?? "1");
+const DAILY_SPEND_CAP_USD = Number(Deno.env.get("AI_DAILY_SPEND_CAP_USD") ?? "3");
 
 /** Below this two records are not about the same thing closely enough to combine. */
 const COSINE_FLOOR = Number(Deno.env.get("DETECT_COSINE_FLOOR") ?? "0.60");

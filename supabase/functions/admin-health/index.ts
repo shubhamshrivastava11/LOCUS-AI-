@@ -26,7 +26,7 @@ import { resolvePermissionScopes } from "../_shared/tenantAuth.ts";
 
 const RESEND_API_KEY = Deno.env.get("RESEND_API_KEY") ?? "";
 const ALERT_EMAIL = Deno.env.get("HEALTH_ALERT_EMAIL") ?? "";
-const DAILY_SPEND_CAP_USD = Number(Deno.env.get("AI_DAILY_SPEND_CAP_USD") ?? "1");
+const DAILY_SPEND_CAP_USD = Number(Deno.env.get("AI_DAILY_SPEND_CAP_USD") ?? "3");
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL") ?? "";
 
 type Status = "pass" | "warn" | "fail";

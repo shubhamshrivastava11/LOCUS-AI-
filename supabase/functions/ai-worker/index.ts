@@ -128,7 +128,17 @@ const CLAUDE_MAX_RETRIES = 3;
 // throttle on normal operation - it is a stop on a burst. The worker drains 40
 // messages a minute on a one-minute cron, so a large backfill can put ~57,000
 // events a day through extraction.
-const DAILY_SPEND_CAP_USD = Number(Deno.env.get("AI_DAILY_SPEND_CAP_USD") ?? "1");
+// Raised from $1 to $3 on 23 Sep 2026. The old ceiling was not holding the
+// line, it was setting a demolition time: the counter resets at 00:00 UTC,
+// the worker meets a full day's backlog, drains it flat out and trips the
+// cap inside 40 minutes, then ingests nothing for the remaining 23 hours.
+// Sep 21 crossed at 20:20, Sep 22 at 00:30 peaking at $2.51, Sep 23 at
+// 00:40 peaking at $2.14 - so real spend was already running at 2x the
+// nominal cap while the product looked broken for most of every day.
+// This env var is the live value; the literal here is only the fallback
+// for an environment that sets nothing, and it is kept equal to the
+// deployed secret so the two cannot quietly disagree.
+const DAILY_SPEND_CAP_USD = Number(Deno.env.get("AI_DAILY_SPEND_CAP_USD") ?? "3");
 
 // Haiku 4.5, USD per million tokens. Same table loci-chat uses.
 const PRICE_PER_MTOK = { input: 1.0, output: 5.0, cacheWrite: 1.25, cacheRead: 0.1 };
@@ -1552,7 +1562,7 @@ async function handleIngestionMessageInner(msg: PgmqMsg): Promise<string> {
       await sql`
         UPDATE public.raw_events
         SET pipeline_status = 'done',
-            triage_result = 'discard',
+            triage_result = 'discarded',
             triage_reason = ${result.reason_code ?? null},
             triage_at = now()
         WHERE id = ${rawEventId}
@@ -1585,7 +1595,7 @@ async function handleIngestionMessageInner(msg: PgmqMsg): Promise<string> {
       await sql`
         UPDATE public.raw_events
         SET pipeline_status = 'done',
-            triage_result = 'uncertain_held',
+            triage_result = 'uncertain',
             triage_reason = ${result.reason_code ?? null},
             triage_at = now()
         WHERE id = ${rawEventId}
@@ -1834,7 +1844,7 @@ async function handleIngestionMessageInner(msg: PgmqMsg): Promise<string> {
     await sql`
       UPDATE public.raw_events
       SET pipeline_status = 'done',
-          triage_result = 'keep',
+          triage_result = 'kept',
           triage_reason = ${result.reason_code ?? null},
           triage_at = now()
       WHERE id = ${rawEventId}
