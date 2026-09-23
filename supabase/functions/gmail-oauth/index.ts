@@ -1,4 +1,5 @@
 import { withTenant } from "../_shared/db.ts";
+import { linkSourceIdentity } from "../_shared/identityLink.ts";
 import { encryptedRefreshTokenFields } from "../_shared/refreshToken.ts";
 import { ensureSourceConnectionDisplayNameColumn } from "../_shared/sourceConnectionSchema.ts";
 import {
@@ -119,6 +120,12 @@ Deno.serve(async (req: Request) => {
           status: 400,
         }, redirectOrigin);
       }
+
+      // The Google account that just authorised this IS one of this
+      // person's addresses, proven by the sign-in - so record it. Gmail is
+      // the case where the two addresses differ most often, because people
+      // connect a personal inbox to a work login.
+      await linkSourceIdentity(tenantId, userId, email, "gmail");
 
       // "new" means only pick up mail from this moment forward -
       // last_synced_at = now() gives gmail-manual-sync exactly that cursor,

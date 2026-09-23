@@ -11,6 +11,7 @@
 // block closing the plaintext-in-the-database gap now).
 
 import { withTenant } from "../_shared/db.ts";
+import { linkSourceIdentity } from "../_shared/identityLink.ts";
 import { enqueueEvent } from "../_shared/queue.ts";
 import { encryptToken } from "../_shared/tokenCrypto.ts";
 import { ensureSourceConnectionDisplayNameColumn } from "../_shared/sourceConnectionSchema.ts";
@@ -95,6 +96,41 @@ async function backfillSlackHistory(tenantId: string, teamId: string, accessToke
   } catch (err) {
     console.error(`Slack backfill failed for team ${teamId}:`, err);
   }
+}
+
+// Resolve the installing user's Slack email, so their Locus account can be
+// linked to it. See _shared/identityLink.ts for why the OAuth callback is
+// the only place both halves of that link are authoritative.
+async function linkInstallerIdentity(
+  tenantId: string,
+  userId: string,
+  slackUserId: string,
+  botToken: string,
+): Promise<void> {
+  let email: string | null = null;
+  try {
+    const res = await fetch(
+      `https://slack.com/api/users.info?user=${encodeURIComponent(slackUserId)}`,
+      { headers: { Authorization: `Bearer ${botToken}` } },
+    );
+    const body = await res.json();
+    // users:read.email is requested at /authorize, but a workspace connected
+    // before that scope was added holds a token without it. Slack answers
+    // ok:false / missing_scope rather than omitting the field, so this is a
+    // real branch for existing connections, not a defensive one.
+    if (!body?.ok) {
+      console.warn("[slack-oauth] identity lookup skipped:", body?.error ?? "users.info failed");
+      return;
+    }
+    email = String(body.user?.profile?.email ?? "").trim() || null;
+  } catch (err) {
+    console.warn(
+      "[slack-oauth] identity lookup failed:",
+      err instanceof Error ? err.message : String(err),
+    );
+    return;
+  }
+  await linkSourceIdentity(tenantId, userId, email, "slack");
 }
 
 // Deploy note: this function must ALWAYS be deployed with --no-verify-jwt.
@@ -222,6 +258,11 @@ Deno.serve(async (req: Request) => {
         error: `Failed to store token: ${message}`,
         status: 500,
       }, redirectOrigin);
+    }
+
+    const installerSlackId = String(tokenData.authed_user?.id ?? "");
+    if (userId && installerSlackId) {
+      await linkInstallerIdentity(tenantId, userId, installerSlackId, tokenData.access_token);
     }
 
     if (syncMode === "full") {
