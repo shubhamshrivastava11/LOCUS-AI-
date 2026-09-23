@@ -1,1 +1,0 @@
-# Structured JSON logger (stdout)

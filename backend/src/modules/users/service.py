@@ -1,1 +1,0 @@
-# User CRUD against Supabase

@@ -1,1 +1,0 @@
-﻿-- pgvector HNSW index + full-text search index definitions

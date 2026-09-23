@@ -1,1 +1,0 @@
-"""Encrypted raw-event persistence."""
