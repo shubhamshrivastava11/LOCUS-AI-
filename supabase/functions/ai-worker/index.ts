@@ -1544,8 +1544,19 @@ async function handleIngestionMessageInner(msg: PgmqMsg): Promise<string> {
   };
 
   if (result.decision === "DISCARD") {
+    // Record the verdict AND the reason. This used to mark the row done and
+    // leave triage_result on its insert-time 'pending', which made a model
+    // discard indistinguishable from an event the model never saw - the
+    // exact ambiguity that sent a Gmail diagnosis after the wrong filter.
     await withTenant(tenantId, async (sql) => {
-      await sql`UPDATE public.raw_events SET pipeline_status = 'done' WHERE id = ${rawEventId}`;
+      await sql`
+        UPDATE public.raw_events
+        SET pipeline_status = 'done',
+            triage_result = 'discard',
+            triage_reason = ${result.reason_code ?? null},
+            triage_at = now()
+        WHERE id = ${rawEventId}
+      `;
     });
     await pgmqDelete("ingestion", msg.msg_id);
     return "discarded";
@@ -1565,8 +1576,20 @@ async function handleIngestionMessageInner(msg: PgmqMsg): Promise<string> {
       threshold: UNCERTAIN_MIN_CONFIDENCE,
       raw_event_id: rawEventId,
     }));
+    // Recorded on the row, not only in the log. A held-out UNCERTAIN is the
+    // outcome most worth counting: it is the model saying "probably
+    // something here" and us deciding not to show it, which is a tuning
+    // choice rather than a judgement about the content. Leaving it visible
+    // only in stdout meant nobody could ask how often we make it.
     await withTenant(tenantId, async (sql) => {
-      await sql`UPDATE public.raw_events SET pipeline_status = 'done' WHERE id = ${rawEventId}`;
+      await sql`
+        UPDATE public.raw_events
+        SET pipeline_status = 'done',
+            triage_result = 'uncertain_held',
+            triage_reason = ${result.reason_code ?? null},
+            triage_at = now()
+        WHERE id = ${rawEventId}
+      `;
     });
     await pgmqDelete("ingestion", msg.msg_id);
     return "uncertain_held_out";
@@ -1808,7 +1831,14 @@ async function handleIngestionMessageInner(msg: PgmqMsg): Promise<string> {
       }, payload.permission_scope ?? []);
     }
 
-    await sql`UPDATE public.raw_events SET pipeline_status = 'done' WHERE id = ${rawEventId}`;
+    await sql`
+      UPDATE public.raw_events
+      SET pipeline_status = 'done',
+          triage_result = 'keep',
+          triage_reason = ${result.reason_code ?? null},
+          triage_at = now()
+      WHERE id = ${rawEventId}
+    `;
     return newDecisionId;
   });
 
