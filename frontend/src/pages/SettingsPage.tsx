@@ -512,7 +512,20 @@ const CONNECTED_SOURCE_META: { id: SourceId; name: SourceName; description: stri
   },
 ]
 
+// A connection the backend has given up on. gmail-manual-sync sets status
+// 'error' only when the provider permanently rejects the stored refresh token
+// (Google's invalid_grant), which no retry can recover - it needs the person
+// to authorise again.
+export function isConnectionBroken(info: { status: string }) {
+  return info.status === 'error'
+}
+
 function formatConnectedSourceSync(info: { status: string; last_synced_at: string | null }) {
+  // Not 'Not connected'. It IS connected, and that is the problem: the
+  // provider revoked our access and the only fix is a reconnect. Lam waited a
+  // month on a Gmail connection in this exact state, because it was hidden
+  // from this list entirely and so read as "never connected".
+  if (isConnectionBroken(info)) return 'Reconnect needed'
   if (info.status !== 'active') return 'Not connected'
   if (!info.last_synced_at) return 'Connected, not yet synced'
 
@@ -1268,7 +1281,17 @@ function ConnectedSourcesSettings() {
     ]).then(([rows, membersResult]) => {
       const next: Record<SourceId, SourceConnectionRow[]> = { slack: [], notion: [], gmail: [], jira: [], confluence: [], discord: [], github: [], monday: [], clickup: [], teams: [] }
       for (const row of rows) {
-        if (row.status === 'active') next[row.source].push(row)
+        // 'error' is listed as well as 'active'. Filtering it out was the real
+        // bug behind "I connected Gmail a month ago and got nothing": a
+        // connection the provider had revoked vanished from this page, so the
+        // only thing on screen was a Connect button, which looks like a
+        // connection that was never made rather than one that broke. A
+        // failure the user cannot see is a failure they cannot fix.
+        //
+        // Deliberately an allow-list rather than "anything except active", so
+        // a status nobody has designed a label for does not start appearing
+        // here with a misleading one.
+        if (row.status === 'active' || row.status === 'error') next[row.source].push(row)
       }
       setConnections(next)
 
@@ -1430,7 +1453,14 @@ function ConnectedSourcesSettings() {
                             <span className="min-w-0 truncate text-[13px] font-medium text-[#111827]">
                               {label ?? 'Connected account'}
                             </span>
-                            <span className="shrink-0 rounded-full bg-[#DCFCE7] px-2.5 py-1 text-[12px] font-medium text-[#16A34A]">
+                            <span
+                              className={
+                                'shrink-0 rounded-full px-2.5 py-1 text-[12px] font-medium ' +
+                                (isConnectionBroken(row)
+                                  ? 'bg-[#FEF2F2] text-[#B4232C]'
+                                  : 'bg-[#DCFCE7] text-[#16A34A]')
+                              }
+                            >
                               {formatConnectedSourceSync(row)}
                             </span>
                             {owner ? (
@@ -1465,9 +1495,11 @@ function ConnectedSourcesSettings() {
                   >
                     {connectingId === source.id
                       ? 'Connecting...'
-                      : rows.length > 0
-                        ? 'Connect another account'
-                        : 'Connect'}
+                      : rows.length === 0
+                        ? 'Connect'
+                        : rows.every(isConnectionBroken)
+                          ? 'Reconnect'
+                          : 'Connect another account'}
                   </button>
                 </div>
               </div>
