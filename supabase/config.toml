@@ -586,8 +586,14 @@ verify_jwt = false
 [functions.teams-webhook]
 verify_jwt = false
 
-# Replays already-ingested events through the pipeline. verify_jwt, same
-# reasoning as admin-seed-departments: this one can spend money, so it must
-# not be reachable with only a shared secret.
+# Replays already-ingested events through the pipeline. verify_jwt = false
+# plus requireInternalKey in the handler, matching admin-health,
+# admin-pipeline-status and admin-detect-channels.
+#
+# This said verify_jwt = true and argued a shared secret was the weaker
+# option. That was backwards. The gateway's verify_jwt admits ANY valid
+# Supabase JWT, so every signed-up user held the credential for an endpoint
+# that runs on withAdmin, treats tenant_id as optional, decrypts raw_content
+# and spends model budget. Operator actions need an operator credential.
 [functions.admin-replay]
-verify_jwt = true
+verify_jwt = false

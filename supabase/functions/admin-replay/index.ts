@@ -49,9 +49,20 @@
 //   only=discarded - the model did see these and said no. Replaying them
 //                    tells you nothing until the prompt changes; afterwards
 //                    it tells you exactly what the change recovered.
+//   only=unjudged   - reached the model but carries no verdict, so it never
+//                     completed a triage pass. Usually a crash or a
+//                     dead-letter, not a decision about the content.
 // Mixing them produces a number that answers neither.
+//
+// 'discarded' reads triage_result, not "skip_reason is null". The first
+// version used the latter and so quietly swept in uncertain rows, rows still
+// pending, and anything that died mid-pipeline - which was defensible only
+// while triage_result was a dead column reading 'pending' everywhere. The
+// same commit that made that column real made this filter wrong, and the
+// preview arithmetic inherited the conflation. Caught in review.
 
 import { withAdmin } from "../_shared/db.ts";
+import { requireInternalKey } from "../_shared/internalAuth.ts";
 import { enqueueEvent, type IngestionEnvelope } from "../_shared/queue.ts";
 import { byteaToUint8Array, decryptRawContent } from "../_shared/rawContentCrypto.ts";
 
@@ -76,6 +87,22 @@ const MAX_BATCH = 200;
 Deno.serve(async (req) => {
   if (req.method === "OPTIONS") return new Response("ok", { headers: corsHeaders });
 
+  // Operator auth, not user auth. The first version of this endpoint was
+  // declared verify_jwt = true with no check in the body, and the config
+  // comment claimed that was SAFER than a shared secret. That had it exactly
+  // backwards, as Lam pointed out in review: the gateway's verify_jwt accepts
+  // any valid Supabase JWT, so every signed-up user held the credential. This
+  // handler runs on withAdmin, takes tenant_id as an OPTIONAL filter (so
+  // omitting it spans every tenant), decrypts raw_content, and spends model
+  // budget. A JWT proves someone signed up; it proves nothing about whether
+  // they may re-queue another tenant's mail or spend the day's budget.
+  //
+  // Every sibling ops tool - admin-health, admin-pipeline-status,
+  // admin-detect-channels - is verify_jwt = false plus requireInternalKey.
+  // This now matches them. See _shared/internalAuth.ts.
+  const unauthorized = await requireInternalKey(req);
+  if (unauthorized) return unauthorized;
+
   const url = new URL(req.url);
   const mode = url.searchParams.get("mode") === "apply" ? "apply" : "preview";
   const source = url.searchParams.get("source");
@@ -87,8 +114,8 @@ Deno.serve(async (req) => {
   if (!source) {
     return json({ error: "source is required, e.g. ?source=gmail" }, 400);
   }
-  if (only && only !== "filtered" && only !== "discarded") {
-    return json({ error: "only must be 'filtered' or 'discarded'" }, 400);
+  if (only && !["filtered", "discarded", "unjudged"].includes(only)) {
+    return json({ error: "only must be 'filtered', 'discarded' or 'unjudged'" }, 400);
   }
   if (mode === "apply" && (!Number.isInteger(requested) || requested < 1)) {
     // Deliberately no default. An apply with no limit is the call someone
@@ -101,7 +128,11 @@ Deno.serve(async (req) => {
     // The candidate set: this source, content still present, nothing ever
     // derived from it. Oldest first, so repeated batches walk the backlog
     // forward instead of re-reading the same head.
-    const rows = await withAdmin(async (sql) => {
+    // Only fetched for an apply. Preview used to run this too, pulling up to
+    // 200 encrypted raw_content blobs across the wire and then returning
+    // without touching one of them - pure I/O for a call whose whole purpose
+    // is to be the cheap, read-only one. Flagged in review.
+    const rows = mode === "preview" ? [] : await withAdmin(async (sql) => {
       return await sql`
         select e.id, e.tenant_id, e.source, e.source_id, e.thread_ref,
                e.permission_scope, e.raw_content, e.received_at,
@@ -114,11 +145,14 @@ Deno.serve(async (req) => {
           )
           and (${only}::text is null
                or (${only}::text = 'filtered'  and e.skip_reason is not null)
-               or (${only}::text = 'discarded' and e.skip_reason is null))
+               or (${only}::text = 'discarded' and e.skip_reason is null
+                     and e.triage_result = 'discarded')
+               or (${only}::text = 'unjudged'  and e.skip_reason is null
+                     and e.triage_result not in ('discarded', 'kept')))
           and (${tenantId}::uuid is null or e.tenant_id = ${tenantId}::uuid)
           and (${since}::timestamptz is null or e.received_at >= ${since}::timestamptz)
         order by e.received_at asc
-        limit ${mode === "apply" ? limit : MAX_BATCH}
+        limit ${limit}
       `;
     });
 
@@ -127,7 +161,11 @@ Deno.serve(async (req) => {
     const totals = await withAdmin(async (sql) => {
       const r = await sql`
         select count(*)::int as matching,
-               count(*) filter (where e.skip_reason is not null)::int as never_reached_model
+               count(*) filter (where e.skip_reason is not null)::int as never_reached_model,
+               count(*) filter (where e.skip_reason is null
+                                and e.triage_result = 'discarded')::int as judged_and_discarded,
+               count(*) filter (where e.skip_reason is null
+                                and e.triage_result not in ('discarded', 'kept'))::int as unjudged
         from public.raw_events e
         where e.source = ${source}
           and e.raw_content is not null
@@ -136,7 +174,10 @@ Deno.serve(async (req) => {
           )
           and (${only}::text is null
                or (${only}::text = 'filtered'  and e.skip_reason is not null)
-               or (${only}::text = 'discarded' and e.skip_reason is null))
+               or (${only}::text = 'discarded' and e.skip_reason is null
+                     and e.triage_result = 'discarded')
+               or (${only}::text = 'unjudged'  and e.skip_reason is null
+                     and e.triage_result not in ('discarded', 'kept')))
           and (${tenantId}::uuid is null or e.tenant_id = ${tenantId}::uuid)
           and (${since}::timestamptz is null or e.received_at >= ${since}::timestamptz)
       `;
@@ -148,8 +189,13 @@ Deno.serve(async (req) => {
         mode,
         source,
         matching: totals.matching,
+        // Counted per verdict rather than inferred by subtraction. The old
+        // `matching - never_reached_model` called everything that was not
+        // prefiltered "discarded", which lumped in rows that never finished a
+        // triage pass at all.
         never_reached_model: totals.never_reached_model,
-        reached_model_and_was_discarded: totals.matching - totals.never_reached_model,
+        judged_and_discarded: totals.judged_and_discarded,
+        unjudged: totals.unjudged,
         max_batch: MAX_BATCH,
         note:
           "These produced no decision, so replaying them cannot duplicate one. " +
